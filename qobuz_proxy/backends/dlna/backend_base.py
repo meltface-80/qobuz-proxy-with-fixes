@@ -32,6 +32,7 @@ from .client import DLNAClient
 from .description import DLNADeviceInfo
 from .didl import build_didl, proxy_key
 from .events import EventSubscription
+from .timing import RELOAD_PLAYING_STEP_SECONDS, RELOAD_PLAYING_WAIT_STEPS
 from .quirks import (
     GAPLESS_AUTO,
     DeviceQuirks,
@@ -380,8 +381,6 @@ class DLNABackendBase(AudioBackend):
 
     async def _wait_until_playing(self) -> None:
         """Wait (briefly) for the renderer to report PLAYING after a reload."""
-        from .timing import RELOAD_PLAYING_STEP_SECONDS, RELOAD_PLAYING_WAIT_STEPS
-
         assert self._client
         for _ in range(RELOAD_PLAYING_WAIT_STEPS):
             await asyncio.sleep(RELOAD_PLAYING_STEP_SECONDS)

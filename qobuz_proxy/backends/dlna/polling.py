@@ -123,22 +123,21 @@ class PollingMixin(TrackEndMixin):
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
 
-    def _poll_suspended(self) -> bool:
+    def _transport_changing(self) -> bool:
         """Nothing of ours to watch, or a Qobuz command is changing the transport."""
-        return (
-            self._starting_playback
-            or self._stopping_playback
-            or not self._current_proxy_url
-            # Paused by a Stop (the renderer refused Pause): it is meant to be stopped.
-            or self._paused_by_stop_ms is not None
-            # This playback already ended; wait for the player to load the next.
-            or self._end_already_reported
-        )
+        return self._starting_playback or self._stopping_playback or not self._current_proxy_url
+
+    def _waiting_for_player(self) -> bool:
+        """The renderer is meant to be stopped: paused by a Stop, or this track ended."""
+        return self._paused_by_stop_ms is not None or self._end_already_reported
 
     async def _poll_once(self) -> None:
         # Spotify/AirPlay/other controllers own their transport and queue.
-        # Their state changes must never trigger Qobuz auto-advance.
-        if self._poll_suspended() or await self.check_external_playback():
+        # Their state changes must never trigger Qobuz auto-advance. Takeovers
+        # are still watched for while the renderer is meant to be stopped.
+        if self._transport_changing() or await self.check_external_playback():
+            return
+        if self._waiting_for_player():
             return
 
         new_state = await self._read_state()

@@ -107,8 +107,12 @@ class EventSubscription:
             await self._request("UNSUBSCRIBE", {"SID": sid})
 
     def handle_notify(self, sid: str, body: str) -> bool:
-        """Deliver a NOTIFY; False if it is not for this subscription."""
-        if not self._sid or sid != self._sid:
+        """Deliver a NOTIFY; False if it is not for this subscription.
+
+        The initial event can arrive before the SUBSCRIBE answer gives us
+        the SID, so one is accepted while the subscription is pending.
+        """
+        if self._sid is not None and sid != self._sid:
             return False
         values = parse_last_change(body)
         if values:
