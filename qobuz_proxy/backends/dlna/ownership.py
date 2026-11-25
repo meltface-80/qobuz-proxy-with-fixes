@@ -29,6 +29,8 @@ IDLE_PLACEHOLDER_PREFIX = "qplay:"
 IDLE = "<idle>"
 # Transport states of a renderer that is not playing anything.
 IDLE_TRANSPORT_STATES = ("STOPPED", "NO_MEDIA_PRESENT")
+# States in which an idle placeholder after our own Stop is not a takeover.
+NOT_PLAYING_STATES = ("STOPPED", "PAUSED_PLAYBACK", "NO_MEDIA_PRESENT")
 
 
 class OwnershipMixin(DLNABackendBase):
@@ -73,7 +75,14 @@ class OwnershipMixin(DLNABackendBase):
         if track_uri and track_uri in (self._current_proxy_url, self._next_track_proxy_url):
             return track_uri
         if placeholder and self._last_stop_at is not None:
-            return IDLE
+            # Idle only while nothing plays (SoundTouch reports PAUSED_PLAYBACK
+            # after our Stop). A placeholder while PLAYING is another source;
+            # an unreadable state is unknown and fails closed.
+            transport = await self._client.get_transport_info()
+            if transport is None:
+                return None
+            if transport.strip().upper() in NOT_PLAYING_STATES:
+                return IDLE
         return uri
 
     async def can_apply_remote_state(self) -> bool:

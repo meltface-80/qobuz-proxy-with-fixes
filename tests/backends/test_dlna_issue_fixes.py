@@ -3,6 +3,8 @@ gapless/end-detection follow-ups (SCPD gate, proxy evidence for early switches).
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from qobuz_proxy.backends.dlna.client import SoapResult
 from qobuz_proxy.backends.dlna.description import DLNADeviceInfo
 from qobuz_proxy.backends.types import PlaybackState
@@ -104,6 +106,31 @@ async def test_qplay_without_our_stop_is_still_a_takeover(store, clock):
     b._client.get_media_info.return_value = "qplay://"
     b._client.get_track_uri.return_value = "http://elsewhere/x.mp3"
     assert await b.check_external_playback() is True
+
+
+async def _stopped_soundtouch(store, clock):
+    b = make_backend(store, clock, manufacturer="Bose", model="SoundTouch 10")
+    b._client.stop.return_value = True
+    await b.stop()
+    b._client.get_media_info.return_value = "qplay://"
+    b._client.get_track_uri.return_value = "http://invalidHost.com/invalidUri.mp3"
+    return b
+
+
+@pytest.mark.parametrize("transport", ["PLAYING", "TRANSITIONING"])
+async def test_qplay_while_playing_after_our_stop_is_a_takeover(store, clock, transport):
+    """Idle only while nothing plays: a playing placeholder is another source."""
+    b = await _stopped_soundtouch(store, clock)
+    b._client.get_transport_info.return_value = transport
+    assert await b.check_external_playback() is True
+
+
+async def test_qplay_after_our_stop_with_unreadable_state_fails_closed(store, clock):
+    b = await _stopped_soundtouch(store, clock)
+    b._client.get_transport_info.return_value = None
+    assert await b.check_external_playback() is False
+    assert await b.can_apply_remote_state() is False
+    assert not b._external_playback
 
 
 def test_soundtouch_profile():
