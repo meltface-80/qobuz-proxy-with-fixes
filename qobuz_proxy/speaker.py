@@ -110,6 +110,18 @@ class Speaker:
         """Human-readable speaker name (used as Qobuz Connect device name)."""
         return self._config.name
 
+    def renderer_location(self) -> Optional[dict[str, str]]:
+        """Where the DLNA renderer was found (ip, port, description URL, UDN)."""
+        if isinstance(self._backend, DLNABackend):
+            return self._backend.location
+        return None
+
+    def forget_learned_behaviour(self) -> bool:
+        """Drop what was learned about this speaker's renderer; True if anything was."""
+        if isinstance(self._backend, DLNABackend):
+            return self._backend.forget_learned_quirks()
+        return False
+
     def get_status(self) -> dict:
         """Return rich status dict for API responses."""
         from qobuz_proxy.config import slugify_name
@@ -136,11 +148,9 @@ class Speaker:
                 "album_art_url": meta.get("artwork_url", ""),
                 "quality": meta.get("quality_name", ""),
             }
-            # With fixed volume (a DLNA-only setting) the proxy never touches or
-            # tracks the renderer's level, so the cached value is just the
-            # initial default — omit it.
-            fixed_volume = self._config.backend_type == "dlna" and self._config.dlna_fixed_volume
-            if not fixed_volume:
+            # With fixed volume the proxy never touches or tracks the output
+            # level, so the cached value is just the initial default — omit it.
+            if not self._config.fixed_volume:
                 now_playing["volume"] = self._player._volume
 
         # Build config section
@@ -166,6 +176,7 @@ class Speaker:
         elif self._config.backend_type == "local":
             config_dict["audio_device"] = self._config.audio_device
             config_dict["buffer_size"] = self._config.audio_buffer_size
+            config_dict["fixed_volume"] = self._config.audio_fixed_volume
 
         return {
             "id": slugify_name(self._config.name),
@@ -203,10 +214,12 @@ class Speaker:
                     proxy_port=self._config.proxy_port,
                     description_url=self._config.dlna_description_url,
                     gapless=self._config.dlna_gapless,
+                    udn=self._config.dlna_udn,
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,
                     buffer_size=self._config.audio_buffer_size,
+                    fixed_volume=self._config.audio_fixed_volume,
                 ),
             ),
             server=ServerConfig(
@@ -308,8 +321,12 @@ class Speaker:
                 backend=backend,
                 play_reporter=PlayReporter(self._api_client),
             )
+            self._player.set_fixed_volume_mode(self._config.fixed_volume)
+            if self._config.fixed_volume and not isinstance(backend, DLNABackend):
+                # Fixed volume means full scale: digital attenuation would
+                # cost resolution the downstream amp should keep (GitHub #32).
+                await backend.set_volume(100)
             if isinstance(backend, DLNABackend):
-                self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
                 self._player.set_playback_permission_check(backend.can_apply_remote_state)
                 backend.on_external_playback(self._on_external_playback)
 

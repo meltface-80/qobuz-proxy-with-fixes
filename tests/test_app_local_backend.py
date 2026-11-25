@@ -101,7 +101,24 @@ class TestSpeakerLocalBackend:
             mock_player = mock_player_class.return_value
             await speaker.start()
 
-        mock_player.set_fixed_volume_mode.assert_not_called()
+        mock_player.set_fixed_volume_mode.assert_called_once_with(False)
+
+    async def test_local_fixed_volume_pins_output_at_full_scale(self) -> None:
+        """GitHub #32: audio_fixed_volume locks the local output at 100%."""
+        speaker = _make_speaker(_make_local_speaker_config(audio_fixed_volume=True))
+
+        with (
+            patch(_SD_PATCH, return_value=_mock_sounddevice()),
+            patch("qobuz_proxy.speaker.QobuzPlayer") as mock_player_class,
+            patch("qobuz_proxy.speaker.DiscoveryService") as mock_disc,
+        ):
+            mock_disc.return_value.start = AsyncMock(side_effect=Exception("stop here"))
+            mock_player = mock_player_class.return_value
+            await speaker.start()
+            backend = mock_player_class.call_args.kwargs["backend"]
+
+        mock_player.set_fixed_volume_mode.assert_called_once_with(True)
+        assert await backend.get_volume() == 100
 
     async def test_setup_websocket_reuses_existing_manager(self) -> None:
         """Fresh handshakes should refresh tokens on the existing manager, not rebuild it."""

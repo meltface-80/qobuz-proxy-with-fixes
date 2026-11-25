@@ -77,6 +77,7 @@ ENV_MAPPINGS = {
     # Local audio
     "QOBUZPROXY_AUDIO_DEVICE": ("backend", "local", "device"),
     "QOBUZPROXY_AUDIO_BUFFER_SIZE": ("backend", "local", "buffer_size"),
+    "QOBUZPROXY_AUDIO_FIXED_VOLUME": ("backend", "local", "fixed_volume"),
     # Server
     "QOBUZPROXY_HTTP_PORT": ("server", "http_port"),
     "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
@@ -148,6 +149,8 @@ class DLNAConfig:
     # Gapless via SetNextAVTransportURI: "auto" (device profile and learned
     # behaviour decide), "on" or "off".
     gapless: str = "auto"
+    # The renderer's UPnP UDN: finds it again by SSDP if its IP address changes.
+    udn: str = ""
 
 
 @dataclass
@@ -156,6 +159,8 @@ class LocalConfig:
 
     device: str = "default"  # Device name, index, or "default"
     buffer_size: int = 2048  # Audio buffer size in frames
+    # Keep output at 100% and ignore volume commands (volume set downstream).
+    fixed_volume: bool = False
 
 
 @dataclass
@@ -198,9 +203,18 @@ class SpeakerConfig:
     dlna_fixed_volume: bool = False
     dlna_description_url: str = ""
     dlna_gapless: str = "auto"  # "auto", "on" or "off"
+    dlna_udn: str = ""  # Renderer UDN, learned on first connect
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
     audio_buffer_size: int = 2048
+    audio_fixed_volume: bool = False
+
+    @property
+    def fixed_volume(self) -> bool:
+        """Whether volume commands are ignored for this speaker's backend."""
+        if self.backend_type == "dlna":
+            return self.dlna_fixed_volume
+        return self.audio_fixed_volume
 
 
 @dataclass
@@ -327,9 +341,13 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
             d["dlna_description_url"] = sc.dlna_description_url
         if sc.dlna_gapless != "auto":
             d["dlna_gapless"] = sc.dlna_gapless
+        if sc.dlna_udn:
+            d["dlna_udn"] = sc.dlna_udn
     elif sc.backend_type == "local":
         d["audio_device"] = sc.audio_device
         d["audio_buffer_size"] = sc.audio_buffer_size
+        if sc.audio_fixed_volume:
+            d["audio_fixed_volume"] = True
     return d
 
 
@@ -348,9 +366,11 @@ def _single_speaker_from_config(config: Config) -> SpeakerConfig:
         dlna_fixed_volume=config.backend.dlna.fixed_volume,
         dlna_description_url=config.backend.dlna.description_url,
         dlna_gapless=parse_gapless_mode(config.backend.dlna.gapless),
+        dlna_udn=config.backend.dlna.udn,
         proxy_port=config.backend.dlna.proxy_port,
         audio_device=config.backend.local.device,
         audio_buffer_size=config.backend.local.buffer_size,
+        audio_fixed_volume=config.backend.local.fixed_volume,
     )
 
 
@@ -431,6 +451,13 @@ def _validate_speakers(speakers: list[SpeakerConfig]) -> None:
         raise ConfigError("Speaker validation failed:\n  - " + "\n  - ".join(errors))
 
 
+def _parse_bool(value: Any) -> bool:
+    """A YAML or environment boolean ("true", "1", "yes", "on")."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
 def _parse_quality_value(value: Any) -> int:
     """Parse a quality value, handling 'auto' string -> AUTO_QUALITY (0)."""
     if isinstance(value, str) and value.lower() == "auto":
@@ -455,9 +482,11 @@ def _parse_yaml_speakers(raw_speakers: list[dict], config: Config) -> list[Speak
             dlna_fixed_volume=bool(raw.get("dlna_fixed_volume", False)),
             dlna_description_url=raw.get("dlna_description_url", ""),
             dlna_gapless=parse_gapless_mode(raw.get("dlna_gapless", "auto")),
+            dlna_udn=str(raw.get("dlna_udn", "") or ""),
             proxy_port=int(raw.get("proxy_port", 0)),
             audio_device=raw.get("audio_device", "default"),
             audio_buffer_size=int(raw.get("audio_buffer_size", 2048)),
+            audio_fixed_volume=_parse_bool(raw.get("audio_fixed_volume", False)),
         )
         speakers.append(speaker)
     return speakers
@@ -506,6 +535,7 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
     proxy_ports_raw = _split_env_padded("QOBUZPROXY_PROXY_PORT", count, "0")
     audio_devices = _split_env_padded("QOBUZPROXY_AUDIO_DEVICE", count, "default")
     audio_buffer_sizes_raw = _split_env_padded("QOBUZPROXY_AUDIO_BUFFER_SIZE", count, "2048")
+    audio_fixed_raw = _split_env_padded("QOBUZPROXY_AUDIO_FIXED_VOLUME", count, "false")
     qualities_raw = _split_env_padded("QOBUZ_MAX_QUALITY", count, "27")
 
     speakers = []
@@ -519,11 +549,12 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
             bind_address=config.server.bind_address,
             dlna_ip=dlna_ips[i],
             dlna_port=int(dlna_ports_raw[i]),
-            dlna_fixed_volume=dlna_fixed_volumes_raw[i].lower() in ("true", "1", "yes", "on"),
+            dlna_fixed_volume=_parse_bool(dlna_fixed_volumes_raw[i]),
             dlna_gapless=parse_gapless_mode(dlna_gapless_raw[i]),
             proxy_port=int(proxy_ports_raw[i]),
             audio_device=audio_devices[i],
             audio_buffer_size=int(audio_buffer_sizes_raw[i]),
+            audio_fixed_volume=_parse_bool(audio_fixed_raw[i]),
         )
         speakers.append(speaker)
 
@@ -635,8 +666,8 @@ def load_env_config() -> dict:
                     logger.warning(f"Invalid integer for {env_var}: {value}")
                     continue
             # Convert boolean values
-            elif env_var == "QOBUZPROXY_DLNA_FIXED_VOLUME":
-                value = value.lower() in ("true", "1", "yes", "on")
+            elif env_var in ("QOBUZPROXY_DLNA_FIXED_VOLUME", "QOBUZPROXY_AUDIO_FIXED_VOLUME"):
+                value = _parse_bool(value)
 
             # Set nested value
             _set_nested(result, path, value)
@@ -717,11 +748,15 @@ def dict_to_config(d: dict) -> Config:
             config.backend.dlna.gapless = parse_gapless_mode(
                 dlna.get("gapless", config.backend.dlna.gapless)
             )
+            config.backend.dlna.udn = str(dlna.get("udn", config.backend.dlna.udn) or "")
         if "local" in b:
             local = b["local"]
             config.backend.local.device = local.get("device", config.backend.local.device)
             config.backend.local.buffer_size = local.get(
                 "buffer_size", config.backend.local.buffer_size
+            )
+            config.backend.local.fixed_volume = _parse_bool(
+                local.get("fixed_volume", config.backend.local.fixed_volume)
             )
 
     # Server

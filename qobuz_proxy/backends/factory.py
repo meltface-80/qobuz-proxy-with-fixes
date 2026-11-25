@@ -71,16 +71,21 @@ class BackendFactory:
 
         # Dispatch to type-specific factory method
         if backend_type == "dlna":
-            description_url = config.backend.dlna.description_url or None
+            dlna = config.backend.dlna
+            bind_address = config.server.bind_address
+            description_url = dlna.description_url or None
             if not description_url:
                 description_url = await cls._discover_description_url(
-                    config.backend.dlna.ip, config.backend.dlna.port or 1400
+                    dlna.ip, dlna.port or 1400, dlna.udn, bind_address
                 )
             return await cls.create_dlna(
-                ip=config.backend.dlna.ip,
-                port=config.backend.dlna.port or 1400,
+                ip=dlna.ip,
+                port=dlna.port or 1400,
+                fixed_volume=dlna.fixed_volume,
                 description_url=description_url,
-                gapless=config.backend.dlna.gapless,
+                gapless=dlna.gapless,
+                udn=dlna.udn,
+                bind_address=bind_address,
             )
         elif backend_type == "local":
             return await cls.create_local(
@@ -100,6 +105,8 @@ class BackendFactory:
         name: Optional[str] = None,
         description_url: Optional[str] = None,
         gapless: str = "auto",
+        udn: str = "",
+        bind_address: str = "0.0.0.0",
     ) -> AudioBackend:
         """
         Create a DLNA backend.
@@ -111,6 +118,8 @@ class BackendFactory:
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
             gapless: "auto", "on" or "off" (see backends/dlna/quirks.py)
+            udn: The renderer's UDN, to find it again if its IP changed
+            bind_address: Interface address for SSDP searches
 
         Returns:
             Connected DLNABackend instance
@@ -125,35 +134,40 @@ class BackendFactory:
             name=name,
             description_url=description_url,
             gapless=gapless,
+            udn=udn,
+            bind_address=bind_address,
         )
         if await backend.connect():
             return backend
         raise BackendNotFoundError(f"Failed to connect to DLNA device at {ip}:{port}")
 
     @classmethod
-    async def _discover_description_url(cls, target_ip: str, target_port: int) -> Optional[str]:
-        """Run SSDP discovery and find the description URL for a device by IP.
+    async def _discover_description_url(
+        cls, target_ip: str, target_port: int, udn: str = "", bind_address: str = "0.0.0.0"
+    ) -> Optional[str]:
+        """Find a renderer's description URL by SSDP.
 
-        Uses a short timeout since we only need to match a specific device.
-
-        Returns:
-            SSDP LOCATION URL if found, None otherwise.
+        Prefers the configured UDN (several renderers can share one host),
+        then the same IP and port, then the same IP.
         """
         from qobuz_proxy.backends.dlna.discovery import DLNADiscovery
 
         try:
-            discovery = DLNADiscovery()
-            devices = await discovery.discover(timeout=3.0)
-            for device in devices:
-                if device.ip == target_ip and device.location:
-                    logger.info(
-                        f"Auto-discovered description URL for {target_ip}: {device.location}"
-                    )
-                    return device.location
-            logger.debug(f"SSDP discovery did not find device at {target_ip}")
+            devices = await DLNADiscovery(bind_address=bind_address).discover(timeout=3.0)
         except Exception as e:
             logger.debug(f"SSDP discovery failed: {e}")
-        return None
+            return None
+        candidates = [d for d in devices if d.location]
+        match = (
+            next((d for d in candidates if udn and d.udn == udn), None)
+            or next((d for d in candidates if d.ip == target_ip and d.port == target_port), None)
+            or next((d for d in candidates if d.ip == target_ip), None)
+        )
+        if match is None:
+            logger.debug(f"SSDP discovery did not find device at {target_ip}")
+            return None
+        logger.info(f"Auto-discovered description URL for {target_ip}: {match.location}")
+        return match.location
 
     @classmethod
     async def create_local(

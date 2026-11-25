@@ -236,6 +236,14 @@ class WsManager:
         logger.info("WebSocket manager stopped")
 
     @property
+    def _fixed_volume(self) -> bool:
+        """Whether this speaker ignores volume commands (DLNA or local backend)."""
+        backend = self.config.backend
+        if backend.type == "dlna":
+            return backend.dlna.fixed_volume
+        return backend.local.fixed_volume
+
+    @property
     def is_connected(self) -> bool:
         """Check if currently connected."""
         return self._is_connected
@@ -579,9 +587,7 @@ class WsManager:
             friendly_name=self.config.device.name,
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
-            supports_volume_control=not (
-                self.config.backend.type == "dlna" and self.config.backend.dlna.fixed_volume
-            ),
+            supports_volume_control=not self._fixed_volume,
             device_type=DEVICE_TYPES[self.config.device.device_type],
             is_active=is_active,
             reason=(
