@@ -1,6 +1,7 @@
 """Speaker edits from the web UI: validation first, rollback on failed saves
 (GitHub #54), and the renderer UDN / address saved after a start."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -155,3 +156,87 @@ class TestRendererLocation:
         with patch.object(app, "_save_config") as save:
             await app._adopt_started_speaker(speaker, sc, app._speakers_epoch)
         save.assert_not_called()
+
+
+class TestFailedEditRestart:
+    """GitHub #53: a failed restart retries in the background, with guards."""
+
+    @staticmethod
+    def _offline(start_side_effect=None):
+        speaker = MagicMock()
+        speaker.name = "Desk"
+        speaker.stop = AsyncMock()
+        speaker.start = AsyncMock(return_value=False, side_effect=start_side_effect)
+        return speaker
+
+    async def test_comes_up_when_renderer_is_back(self):
+        app = _app(_speaker_config())
+        offline = self._offline()
+        back = self._offline()
+        back.start = AsyncMock(return_value=True)
+        back.renderer_location.return_value = None
+        with (
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[offline, back]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("desk", {"dlna_ip": "192.168.1.60"})
+            await asyncio.wait_for(app._speaker_retry_tasks["desk"], timeout=1)
+        assert app._speakers == [back]
+        assert app._speaker_retry_tasks == {}
+
+    async def test_not_retried_after_logout(self):
+        app = _app(_speaker_config())
+
+        async def start_during_logout() -> bool:
+            app._speakers_epoch += 1  # what _stop_speakers() does on logout
+            return False
+
+        with (
+            patch(
+                "qobuz_proxy.app_speakers.Speaker",
+                return_value=self._offline(start_during_logout),
+            ),
+            patch.object(app, "_save_config"),
+        ):
+            result = await app._on_edit_speaker("desk", {"dlna_ip": "192.168.1.60"})
+        assert app._speakers == [] and app._speaker_retry_tasks == {}
+        assert "warning" in result
+
+    async def test_not_retried_once_removed(self):
+        app = _app(_speaker_config())
+
+        async def start_while_removed() -> bool:
+            await app._on_remove_speaker("desk")
+            return False
+
+        with (
+            patch(
+                "qobuz_proxy.app_speakers.Speaker",
+                return_value=self._offline(start_while_removed),
+            ),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("desk", {"dlna_ip": "192.168.1.60"})
+        assert app._config.speakers == [] and app._speaker_retry_tasks == {}
+
+    async def test_retried_after_relogin(self):
+        """A login during the edit skipped the reserved speaker, so retry it."""
+        app = _app(_speaker_config())
+        app._is_running = True
+
+        async def start_during_relogin() -> bool:
+            app._speakers_epoch += 1  # logout; the login that follows skips "desk"
+            return False
+
+        with (
+            patch(
+                "qobuz_proxy.app_speakers.Speaker",
+                return_value=self._offline(start_during_relogin),
+            ),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("desk", {"dlna_ip": "192.168.1.60"})
+        retry = app._speaker_retry_tasks.get("desk")
+        assert retry is not None and not retry.done()
+        await app._stop_speakers()

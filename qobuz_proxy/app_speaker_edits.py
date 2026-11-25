@@ -262,7 +262,11 @@ class SpeakerEditMixin(SpeakerLifecycleMixin):
             f"Speaker '{new_config.name}' failed to start with new config "
             "(configuration saved; retrying in background)"
         )
-        if epoch == self._speakers_epoch:
+        if epoch != self._speakers_epoch:
+            # Logged out (and maybe in again) meanwhile: retry only if a new
+            # login skipped this speaker because the edit still held it.
+            self._retry_after_stale_start(new_config)
+        elif any(sc is new_config for sc in self._config.speakers):  # not removed meanwhile
             self._schedule_speaker_retry(new_config)
         status = configured_speaker_status(new_config, "starting")
         status["warning"] = "Configuration saved, but the speaker failed to start"
