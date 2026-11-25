@@ -3,77 +3,42 @@ Local audio backend.
 
 Downloads FLAC audio from Qobuz, decodes to float32 samples,
 and plays through the local audio device via PortAudio.
+
+See ``backend_base.py`` for how the backend is layered.
 """
 
 import asyncio
-import io
 import logging
 from typing import Optional
 
-import aiohttp
 import numpy as np
 
-from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.backends.types import (
     BackendInfo,
     BackendTrackMetadata,
     BufferStatus,
     PlaybackState,
 )
-from .device import AudioDeviceInfo, resolve_device
+from .backend_base import (
+    BUFFER_HIGH_WATER,
+    BUFFER_SECONDS,
+    CHUNK_SIZE,
+    buffer_status_for_level,
+)
+from .device import resolve_device
+from .gapless import LocalGaplessMixin
 from .ring_buffer import RingBuffer
 from .stream import AudioOutputStream
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 8192  # Frames per feed iteration
-BUFFER_SECONDS = 10  # Ring buffer capacity in seconds
-BUFFER_HIGH_WATER = 0.8  # Pause feeding when buffer above this level
 # How long to keep waiting for the next track's download after the ring buffer
 # has fully drained before abandoning the gapless transition.
 NEXT_TRACK_GRACE_SECONDS = 10.0
 
 
-class LocalAudioBackend(AudioBackend):
+class LocalAudioBackend(LocalGaplessMixin):
     """Local audio output backend using sounddevice/PortAudio."""
-
-    def __init__(
-        self,
-        device: str = "default",
-        buffer_size: int = 2048,
-        name: str = "Local Audio",
-    ):
-        super().__init__(name)
-        self._device_config = device
-        self._buffer_size = buffer_size
-
-        # Device and audio components (initialized in connect())
-        self._device_info: Optional[AudioDeviceInfo] = None
-        self._ring_buffer: Optional[RingBuffer] = None
-        self._stream: Optional[AudioOutputStream] = None
-
-        # Playback state
-        self._audio_data: Optional[np.ndarray] = None
-        self._sample_rate: int = 0
-        self._frames_fed: int = 0
-        self._total_frames: int = 0
-        self._feeding_task: Optional[asyncio.Task] = None
-
-        # Seek support
-        self._seek_target: Optional[int] = None
-
-        # Buffer status tracking
-        self._last_buffer_status: BufferStatus = BufferStatus.OK
-
-        # Gapless: prefetched next track (compressed bytes; decoded at transition)
-        self._next_track_meta: Optional[BackendTrackMetadata] = None
-        self._next_prefetch_task: Optional["asyncio.Task[bytes]"] = None
-        self._next_decode_task: Optional["asyncio.Task[tuple[np.ndarray, int]]"] = None
-
-        # Gapless: audio data has been swapped to the next track but the old
-        # track's tail is still draining from the ring buffer
-        self._transition_pending: bool = False
-        self._prev_total_frames: int = 0
 
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
         """Download FLAC, decode, and start playback."""
@@ -123,9 +88,10 @@ class LocalAudioBackend(AudioBackend):
             self._ring_buffer = RingBuffer(buffer_frames, channels)
 
             # Update stream's ring buffer and open/reconfigure
-            self._stream.set_ring_buffer(self._ring_buffer)
-            self._stream.open(sample_rate, channels)
-            self._stream.start()
+            stream = self._active_stream()
+            stream.set_ring_buffer(self._ring_buffer)
+            stream.open(sample_rate, channels)
+            stream.start()
 
             # Start feeding loop
             self._feeding_task = asyncio.create_task(self._feeding_loop())
@@ -141,40 +107,6 @@ class LocalAudioBackend(AudioBackend):
             self._notify_state_change(PlaybackState.ERROR)
             self._notify_playback_error(str(e))
 
-    async def _download(self, url: str) -> bytes:
-        """Download the audio file bytes."""
-        logger.debug("Downloading audio from URL...")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                data = await response.read()
-
-        logger.debug(f"Downloaded {len(data)} bytes")
-        return data
-
-    async def _decode(self, data: bytes) -> tuple[np.ndarray, int]:
-        """Decode audio bytes to a float32 numpy array in a worker thread.
-
-        Decoding a full track blocks long enough to starve the feeding loop
-        (and thus the ring buffer) if run on the event loop.
-        """
-        import soundfile as sf
-
-        audio_data, sample_rate = await asyncio.to_thread(
-            sf.read, io.BytesIO(data), dtype="float32"
-        )
-
-        # Ensure 2D array (frames, channels)
-        if audio_data.ndim == 1:
-            audio_data = audio_data.reshape(-1, 1)
-
-        logger.debug(f"Decoded: {len(audio_data)} frames, {audio_data.shape[1]}ch, {sample_rate}Hz")
-        return audio_data, sample_rate
-
-    async def _download_and_decode(self, url: str) -> tuple[np.ndarray, int]:
-        """Download audio file and decode to float32 numpy array."""
-        return await self._decode(await self._download(url))
-
     async def _feeding_loop(self) -> None:
         """Feed decoded audio to the ring buffer, transitioning gaplessly into
         the prefetched next track when one is armed."""
@@ -188,7 +120,7 @@ class LocalAudioBackend(AudioBackend):
                 # No next track. Drain the tail, watching for a transition that
                 # completes mid-drain (next track shorter than the buffer) and
                 # for a late arm from the player after that callback fires.
-                while self._ring_buffer.available() > 0:
+                while self._active_buffer().available() > 0:
                     if self._state == PlaybackState.STOPPED:
                         return
                     self._maybe_complete_transition()
@@ -218,7 +150,7 @@ class LocalAudioBackend(AudioBackend):
             if self._seek_target is not None:
                 target = self._seek_target
                 self._seek_target = None
-                self._ring_buffer.clear()
+                self._active_buffer().clear()
                 self._frames_fed = min(target, self._total_frames)
                 logger.debug(f"Seek applied: jumping to frame {self._frames_fed}")
                 if self._frames_fed >= self._total_frames:
@@ -231,14 +163,14 @@ class LocalAudioBackend(AudioBackend):
             self._maybe_complete_transition()
 
             # Pace: wait if buffer is full enough
-            if self._ring_buffer.fill_level() > BUFFER_HIGH_WATER:
+            if self._active_buffer().fill_level() > BUFFER_HIGH_WATER:
                 await asyncio.sleep(0.05)
                 continue
 
             # Feed next chunk
             end = min(self._frames_fed + CHUNK_SIZE, self._total_frames)
-            chunk = self._audio_data[self._frames_fed : end]
-            written = self._ring_buffer.write(chunk)
+            chunk = self._active_audio()[self._frames_fed : end]
+            written = self._active_buffer().write(chunk)
             self._frames_fed += written
 
             # Check buffer health
@@ -258,53 +190,6 @@ class LocalAudioBackend(AudioBackend):
             except asyncio.CancelledError:
                 pass
         self._feeding_task = None
-
-    # =========================================================================
-    # Gapless Playback
-    # =========================================================================
-
-    @property
-    def supports_gapless(self) -> bool:
-        """Gapless is supported by prefetching the next track."""
-        return True
-
-    async def set_next_track(
-        self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
-    ) -> bool:
-        """Prefetch the next track so the feeding loop can transition without a gap.
-
-        Only the compressed bytes are downloaded up front; decoding happens at
-        transition time (in a worker thread, with the buffered tail of the
-        current track as cushion) to avoid holding two fully decoded tracks in
-        memory for the whole duration of the current one.
-        """
-        await self.clear_next_track()
-        self._next_track_meta = metadata
-        self._next_prefetch_task = asyncio.create_task(self._download(url))
-        logger.debug(f"Gapless: prefetching next track {metadata.track_id}")
-        return True
-
-    async def clear_next_track(self) -> None:
-        """Cancel and discard the prefetched next track."""
-        tasks = (self._next_prefetch_task, self._next_decode_task)
-        self._next_prefetch_task = None
-        self._next_decode_task = None
-        self._next_track_meta = None
-        for task in tasks:
-            if task is None:
-                continue
-            if not task.done():
-                task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.debug(f"Discarding failed next-track prefetch: {e}")
-
-    def _next_track_armed(self) -> bool:
-        """Whether a next track is currently prefetching or prefetched."""
-        return self._next_prefetch_task is not None
 
     async def _take_next_track_audio(self) -> Optional[tuple[np.ndarray, int]]:
         """Wait for the armed next track's download, then decode it.
@@ -435,41 +320,6 @@ class LocalAudioBackend(AudioBackend):
         self._seek_target = None
         return True
 
-    def _maybe_complete_transition(self) -> None:
-        """Fire the next-track-started callback once the old track's tail has
-        fully left the ring buffer (everything still buffered is new audio)."""
-        if not self._transition_pending:
-            return
-        available = self._ring_buffer.available() if self._ring_buffer else 0
-        if self._frames_fed >= available:
-            self._transition_pending = False
-            self._forget_consumed_next_track()
-            logger.info("Gapless: transitioned to next track")
-            self._notify_next_track_started()
-
-    def _forget_consumed_next_track(self) -> None:
-        """Release retained decoding once the audible track boundary is crossed."""
-        if self._next_prefetch_task is None:
-            self._next_decode_task = None
-            self._next_track_meta = None
-
-    def _playback_position_ms(self) -> int:
-        """Current position accounting for buffer latency and, mid-transition,
-        for the old track's tail still draining from the buffer."""
-        if self._sample_rate == 0:
-            return 0
-
-        available = self._ring_buffer.available() if self._ring_buffer else 0
-
-        if self._transition_pending and available > self._frames_fed:
-            # Buffer still holds old-track frames: report the old track's position
-            old_remaining = available - self._frames_fed
-            position_frames = max(0, self._prev_total_frames - old_remaining)
-        else:
-            position_frames = max(0, self._frames_fed - available)
-
-        return int(position_frames / self._sample_rate * 1000)
-
     async def pause(self) -> None:
         if self._stream:
             self._stream.pause()
@@ -549,32 +399,14 @@ class LocalAudioBackend(AudioBackend):
         if not self._ring_buffer:
             return BufferStatus.OK
 
-        level = self._ring_buffer.fill_level()
-
-        if level == 0.0:
-            return BufferStatus.EMPTY
-        elif level < 0.10:
-            return BufferStatus.LOW
-        elif level >= 1.0:
-            return BufferStatus.FULL
-        else:
-            return BufferStatus.OK
+        return buffer_status_for_level(self._ring_buffer.fill_level())
 
     def _check_buffer_status(self) -> None:
         """Check and notify buffer status changes."""
         if not self._ring_buffer:
             return
 
-        level = self._ring_buffer.fill_level()
-
-        if level == 0.0:
-            status = BufferStatus.EMPTY
-        elif level < 0.10:
-            status = BufferStatus.LOW
-        elif level >= 1.0:
-            status = BufferStatus.FULL
-        else:
-            status = BufferStatus.OK
+        status = buffer_status_for_level(self._ring_buffer.fill_level())
 
         if status != self._last_buffer_status:
             self._last_buffer_status = status

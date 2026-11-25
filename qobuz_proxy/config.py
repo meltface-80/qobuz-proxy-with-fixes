@@ -6,55 +6,112 @@ Priority order (highest to lowest):
 2. Environment variables
 3. Configuration file (YAML)
 4. Default values
+
+The data model lives in ``config_models``, speaker-list building in
+``config_speakers`` and validation in ``config_validation``; every name stays
+importable from this module.
 """
 
 import logging
 import os
-import platform
-import re
-import uuid
-from dataclasses import dataclass, field
+import platform as platform  # Re-exported: tests patch qobuz_proxy.config.platform.node
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
+from qobuz_proxy.config_models import (
+    AUTO_FALLBACK_QUALITY,
+    AUTO_QUALITY,
+    DEFAULT_DEVICE_TYPE,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_PROXY_PORT,
+    DEVICE_TYPES,
+    GAPLESS_AUTO,
+    GAPLESS_MODES,
+    GAPLESS_OFF,
+    GAPLESS_ON,
+    VALID_LOG_LEVELS,
+    VALID_QUALITIES,
+    BackendConfig,
+    Config,
+    ConfigError,
+    DeviceConfig,
+    DLNAConfig,
+    LocalConfig,
+    LoggingConfig,
+    QobuzConfig,
+    ServerConfig,
+    SpeakerConfig,
+    _parse_bool,
+    parse_device_type,
+    parse_gapless_mode,
+)
+from qobuz_proxy.config_speakers import (
+    build_speaker_configs,
+    generate_speaker_uuid,
+    slugify_name,
+    speaker_component_config,
+    speaker_config_to_dict,
+)
+from qobuz_proxy.config_validation import validate_config, validate_email, validate_port
+
+# Private helpers kept importable from their historical location.
+from qobuz_proxy.config_models import _parse_quality_value as _parse_quality_value
+from qobuz_proxy.config_speakers import (
+    _SPEAKER_UUID_NAMESPACE as _SPEAKER_UUID_NAMESPACE,
+    _assign_ports as _assign_ports,
+    _generate_uuids as _generate_uuids,
+    _parse_env_speakers as _parse_env_speakers,
+    _parse_yaml_speakers as _parse_yaml_speakers,
+    _single_speaker_from_config as _single_speaker_from_config,
+    _split_env as _split_env,
+    _split_env_padded as _split_env_padded,
+)
+from qobuz_proxy.config_validation import _validate_speakers as _validate_speakers
+
+__all__ = [
+    "AUTO_FALLBACK_QUALITY",
+    "AUTO_QUALITY",
+    "DEFAULT_DEVICE_TYPE",
+    "DEFAULT_HTTP_PORT",
+    "DEFAULT_PROXY_PORT",
+    "DEVICE_TYPES",
+    "ENV_MAPPINGS",
+    "GAPLESS_AUTO",
+    "GAPLESS_MODES",
+    "GAPLESS_OFF",
+    "GAPLESS_ON",
+    "VALID_LOG_LEVELS",
+    "VALID_QUALITIES",
+    "BackendConfig",
+    "Config",
+    "ConfigError",
+    "DeviceConfig",
+    "DLNAConfig",
+    "LocalConfig",
+    "LoggingConfig",
+    "QobuzConfig",
+    "ServerConfig",
+    "SpeakerConfig",
+    "build_speaker_configs",
+    "dict_to_config",
+    "generate_speaker_uuid",
+    "load_config",
+    "load_env_config",
+    "load_yaml_config",
+    "merge_configs",
+    "parse_device_type",
+    "parse_gapless_mode",
+    "slugify_name",
+    "speaker_component_config",
+    "speaker_config_to_dict",
+    "validate_config",
+    "validate_email",
+    "validate_port",
+]
+
 logger = logging.getLogger(__name__)
-
-
-# Valid quality values (0 = auto-detect from device capabilities)
-AUTO_QUALITY = 0
-AUTO_FALLBACK_QUALITY = 6  # CD quality fallback when auto-detection fails
-VALID_QUALITIES = {0, 5, 6, 7, 27}
-
-# Default ports
-DEFAULT_HTTP_PORT = 8689
-DEFAULT_PROXY_PORT = 7120
-
-# Namespace UUID for deterministic speaker UUID generation
-_SPEAKER_UUID_NAMESPACE = uuid.UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479")
-
-# Qobuz Connect device types (DeviceType enum in protos/qconnect_common.proto).
-# The type selects the icon the Qobuz app shows for the device. The enum values
-# come from StreamCore32 (https://github.com/tobiasguyer/StreamCore32); qonductor
-# (https://github.com/nickblt/qonductor, Rust) uses the same values. The names are
-# the ones the Qobuz web player uses, as documented by qobuz-connect
-# (https://github.com/ciaens/qobuz-connect).
-DEFAULT_DEVICE_TYPE = "speaker"
-DEVICE_TYPES = {
-    "speaker": 1,
-    "streamer": 2,
-    "tv": 3,
-    "soundbar": 4,
-    "computer": 5,
-    "mobile": 6,
-    "cast": 7,
-    "headphones": 8,
-    "tablet": 9,
-}
-
-# Valid log levels
-VALID_LOG_LEVELS = {"debug", "info", "warning", "error"}
 
 # Environment variable mappings
 ENV_MAPPINGS = {
@@ -84,511 +141,6 @@ ENV_MAPPINGS = {
     # Logging
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
 }
-
-
-class ConfigError(Exception):
-    """Configuration error."""
-
-    pass
-
-
-@dataclass
-class QobuzConfig:
-    """Qobuz account configuration."""
-
-    email: str = ""
-    auth_token: str = ""
-    user_id: str = ""
-    max_quality: int = 27  # 5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k
-
-
-@dataclass
-class DeviceConfig:
-    """Device identification configuration."""
-
-    name: str = "QobuzProxy"
-    uuid: str = ""  # Auto-generated if empty
-    device_type: str = DEFAULT_DEVICE_TYPE  # Key of DEVICE_TYPES
-
-    def __post_init__(self) -> None:
-        if not self.uuid:
-            self.uuid = str(uuid.uuid4())
-
-
-GAPLESS_AUTO = "auto"
-GAPLESS_ON = "on"
-GAPLESS_OFF = "off"
-GAPLESS_MODES = (GAPLESS_AUTO, GAPLESS_ON, GAPLESS_OFF)
-
-
-def parse_gapless_mode(value: object) -> str:
-    """Normalise a gapless setting to "auto", "on" or "off".
-
-    YAML booleans are accepted (``gapless: false`` means "off"); anything
-    unrecognised means "auto".
-    """
-    if isinstance(value, bool):
-        return GAPLESS_ON if value else GAPLESS_OFF
-    text = str(value or "").strip().lower()
-    if text in ("on", "true", "yes", "1", "enabled"):
-        return GAPLESS_ON
-    if text in ("off", "false", "no", "0", "disabled"):
-        return GAPLESS_OFF
-    return GAPLESS_AUTO
-
-
-@dataclass
-class DLNAConfig:
-    """DLNA backend configuration."""
-
-    ip: str = ""
-    port: int = 1400
-    fixed_volume: bool = False
-    proxy_port: int = 7120
-    description_url: str = ""  # Full URL to UPnP device description XML (auto-discovered via SSDP)
-    # Gapless via SetNextAVTransportURI: "auto" (device profile and learned
-    # behaviour decide), "on" or "off".
-    gapless: str = "auto"
-    # The renderer's UPnP UDN: finds it again by SSDP if its IP address changes.
-    udn: str = ""
-
-
-@dataclass
-class LocalConfig:
-    """Local audio backend configuration."""
-
-    device: str = "default"  # Device name, index, or "default"
-    buffer_size: int = 2048  # Audio buffer size in frames
-    # Keep output at 100% and ignore volume commands (volume set downstream).
-    fixed_volume: bool = False
-
-
-@dataclass
-class BackendConfig:
-    """Audio backend configuration."""
-
-    type: str = "dlna"
-    dlna: DLNAConfig = field(default_factory=DLNAConfig)
-    local: LocalConfig = field(default_factory=LocalConfig)
-
-
-@dataclass
-class ServerConfig:
-    """Server configuration."""
-
-    http_port: int = 8689
-    bind_address: str = "0.0.0.0"
-
-
-@dataclass
-class LoggingConfig:
-    """Logging configuration."""
-
-    level: str = "info"
-
-
-@dataclass
-class SpeakerConfig:
-    """Per-speaker configuration for multi-speaker mode."""
-
-    name: str = "QobuzProxy"
-    uuid: str = ""
-    device_type: str = DEFAULT_DEVICE_TYPE
-    backend_type: str = "dlna"
-    max_quality: int = 27
-    http_port: int = 0  # 0 = auto-assign
-    bind_address: str = "0.0.0.0"
-    dlna_ip: str = ""
-    dlna_port: int = 1400
-    dlna_fixed_volume: bool = False
-    dlna_description_url: str = ""
-    dlna_gapless: str = "auto"  # "auto", "on" or "off"
-    dlna_udn: str = ""  # Renderer UDN, learned on first connect
-    proxy_port: int = 0  # 0 = auto-assign
-    audio_device: str = "default"
-    audio_buffer_size: int = 2048
-    audio_fixed_volume: bool = False
-
-    @property
-    def fixed_volume(self) -> bool:
-        """Whether volume commands are ignored for this speaker's backend."""
-        if self.backend_type == "dlna":
-            return self.dlna_fixed_volume
-        return self.audio_fixed_volume
-
-
-@dataclass
-class Config:
-    """Complete QobuzProxy configuration."""
-
-    qobuz: QobuzConfig = field(default_factory=QobuzConfig)
-    device: DeviceConfig = field(default_factory=DeviceConfig)
-    backend: BackendConfig = field(default_factory=BackendConfig)
-    server: ServerConfig = field(default_factory=ServerConfig)
-    logging: LoggingConfig = field(default_factory=LoggingConfig)
-    speakers: list[SpeakerConfig] = field(default_factory=list)
-    config_path: Optional[Path] = None  # Set by load_config() when loading from file
-
-
-def validate_email(email: str) -> bool:
-    """Validate email format."""
-    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-    return bool(re.match(pattern, email))
-
-
-def validate_port(port: int) -> bool:
-    """Validate port number."""
-    return 1 <= port <= 65535
-
-
-def validate_config(config: Config) -> None:
-    """
-    Validate configuration.
-
-    Raises:
-        ConfigError: If configuration is invalid
-    """
-    errors = []
-
-    # Qobuz credentials (optional — token-based auth may provide them later)
-    if config.qobuz.email and not validate_email(config.qobuz.email):
-        errors.append(f"Invalid email format: {config.qobuz.email}")
-
-    if config.qobuz.max_quality not in VALID_QUALITIES:
-        errors.append(
-            f"Invalid max_quality: {config.qobuz.max_quality}. "
-            f"Valid values: {sorted(VALID_QUALITIES)}"
-        )
-
-    # Backend
-    if config.backend.type == "dlna":
-        if not config.backend.dlna.ip:
-            errors.append("DLNA IP address is required when backend type is 'dlna'")
-        if not validate_port(config.backend.dlna.port):
-            errors.append(f"Invalid DLNA port: {config.backend.dlna.port}")
-        if not validate_port(config.backend.dlna.proxy_port):
-            errors.append(f"Invalid proxy port: {config.backend.dlna.proxy_port}")
-    elif config.backend.type == "local":
-        if not (64 <= config.backend.local.buffer_size <= 16384):
-            errors.append(
-                f"Invalid buffer_size: {config.backend.local.buffer_size}. "
-                f"Must be between 64 and 16384"
-            )
-    elif config.backend.type != "stub":
-        errors.append(f"Unknown backend type: {config.backend.type}")
-
-    # Server ports
-    if not validate_port(config.server.http_port):
-        errors.append(f"Invalid HTTP port: {config.server.http_port}")
-
-    # Logging
-    if config.logging.level.lower() not in VALID_LOG_LEVELS:
-        errors.append(
-            f"Invalid log level: {config.logging.level}. Valid values: {sorted(VALID_LOG_LEVELS)}"
-        )
-
-    if errors:
-        raise ConfigError("Configuration validation failed:\n  - " + "\n  - ".join(errors))
-
-
-def parse_device_type(value: Any) -> str:
-    """Normalize a device type name (e.g. "Headphones" -> "headphones").
-
-    Raises:
-        ConfigError: If the value is not a known device type.
-    """
-    device_type = str(value).strip().lower() if value is not None else ""
-    if not device_type:
-        return DEFAULT_DEVICE_TYPE
-    if device_type not in DEVICE_TYPES:
-        raise ConfigError(
-            f"Invalid device_type: {value!r}. Valid values: {', '.join(DEVICE_TYPES)}"
-        )
-    return device_type
-
-
-def generate_speaker_uuid(speaker_name: str) -> str:
-    """Generate a deterministic UUID for a speaker based on hostname and name."""
-    return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"{platform.node()}:{speaker_name}"))
-
-
-def slugify_name(name: str) -> str:
-    """Convert a speaker name to a URL-safe slug."""
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-
-
-def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
-    """Convert a SpeakerConfig to a YAML-serializable dict.
-
-    Ports are omitted so they can be re-assigned on next startup. The Qobuz
-    Connect device UUID is persisted so the same speaker identity survives
-    restarts (including Docker hostname changes).
-    """
-    d: dict = {
-        "name": sc.name,
-        "backend": sc.backend_type,
-        "max_quality": "auto" if sc.max_quality == AUTO_QUALITY else sc.max_quality,
-    }
-    if sc.uuid:
-        d["uuid"] = sc.uuid
-    if sc.device_type != DEFAULT_DEVICE_TYPE:
-        d["device_type"] = sc.device_type
-    if sc.backend_type == "dlna":
-        d["dlna_ip"] = sc.dlna_ip
-        d["dlna_port"] = sc.dlna_port
-        d["dlna_fixed_volume"] = sc.dlna_fixed_volume
-        if sc.dlna_description_url:
-            d["dlna_description_url"] = sc.dlna_description_url
-        if sc.dlna_gapless != "auto":
-            d["dlna_gapless"] = sc.dlna_gapless
-        if sc.dlna_udn:
-            d["dlna_udn"] = sc.dlna_udn
-    elif sc.backend_type == "local":
-        d["audio_device"] = sc.audio_device
-        d["audio_buffer_size"] = sc.audio_buffer_size
-        if sc.audio_fixed_volume:
-            d["audio_fixed_volume"] = True
-    return d
-
-
-def _single_speaker_from_config(config: Config) -> SpeakerConfig:
-    """Map flat Config fields to a single SpeakerConfig."""
-    return SpeakerConfig(
-        name=config.device.name,
-        uuid=config.device.uuid,
-        device_type=config.device.device_type,
-        backend_type=config.backend.type,
-        max_quality=config.qobuz.max_quality,
-        http_port=0,  # auto-assigned by _assign_ports (avoids conflict with web UI port)
-        bind_address=config.server.bind_address,
-        dlna_ip=config.backend.dlna.ip,
-        dlna_port=config.backend.dlna.port,
-        dlna_fixed_volume=config.backend.dlna.fixed_volume,
-        dlna_description_url=config.backend.dlna.description_url,
-        dlna_gapless=parse_gapless_mode(config.backend.dlna.gapless),
-        dlna_udn=config.backend.dlna.udn,
-        proxy_port=config.backend.dlna.proxy_port,
-        audio_device=config.backend.local.device,
-        audio_buffer_size=config.backend.local.buffer_size,
-        audio_fixed_volume=config.backend.local.fixed_volume,
-    )
-
-
-def _assign_ports(speakers: list[SpeakerConfig], webui_port: int = DEFAULT_HTTP_PORT) -> None:
-    """Auto-assign http_port and proxy_port to speakers that have 0 (auto)."""
-    used_http: set[int] = {s.http_port for s in speakers if s.http_port != 0}
-    # Reserve the web UI port so speakers don't collide with it
-    used_http.add(webui_port)
-    used_proxy: set[int] = {s.proxy_port for s in speakers if s.proxy_port != 0}
-
-    next_http = DEFAULT_HTTP_PORT
-    next_proxy = DEFAULT_PROXY_PORT
-
-    for speaker in speakers:
-        if speaker.http_port == 0:
-            while next_http in used_http:
-                next_http += 1
-            speaker.http_port = next_http
-            used_http.add(next_http)
-            next_http += 1
-
-        if speaker.backend_type == "dlna" and speaker.proxy_port == 0:
-            while next_proxy in used_proxy:
-                next_proxy += 1
-            speaker.proxy_port = next_proxy
-            used_proxy.add(next_proxy)
-            next_proxy += 1
-
-
-def _generate_uuids(speakers: list[SpeakerConfig]) -> None:
-    """Generate deterministic UUIDs for speakers that have an empty uuid."""
-    for speaker in speakers:
-        if not speaker.uuid:
-            speaker.uuid = generate_speaker_uuid(speaker.name)
-
-
-def _validate_speakers(speakers: list[SpeakerConfig]) -> None:
-    """
-    Validate speaker list.
-
-    Raises:
-        ConfigError: If speakers list is empty, has duplicate names, or port conflicts.
-    """
-    if not speakers:
-        return  # Empty is valid — speakers can be added at runtime via the web UI
-
-    names = [s.name for s in speakers]
-    if len(names) != len(set(names)):
-        seen: set[str] = set()
-        dupes: list[str] = []
-        for n in names:
-            if n in seen:
-                dupes.append(n)
-            else:
-                seen.add(n)
-        raise ConfigError(f"Duplicate speaker names: {dupes}")
-
-    http_ports = [s.http_port for s in speakers]
-    if len(http_ports) != len(set(http_ports)):
-        raise ConfigError(f"HTTP port conflicts among speakers: {http_ports}")
-
-    proxy_ports = [s.proxy_port for s in speakers if s.backend_type == "dlna" and s.proxy_port]
-    if len(proxy_ports) != len(set(proxy_ports)):
-        raise ConfigError(f"Proxy port conflicts among speakers: {proxy_ports}")
-
-    # Per-speaker field validation
-    errors = []
-    for s in speakers:
-        if s.backend_type == "dlna" and not s.dlna_ip:
-            errors.append(f"Speaker '{s.name}': DLNA IP address is required")
-        if s.backend_type not in ("dlna", "local", "stub"):
-            errors.append(f"Speaker '{s.name}': unknown backend type '{s.backend_type}'")
-        if s.http_port and not validate_port(s.http_port):
-            errors.append(f"Speaker '{s.name}': invalid HTTP port {s.http_port}")
-        if s.proxy_port and not validate_port(s.proxy_port):
-            errors.append(f"Speaker '{s.name}': invalid proxy port {s.proxy_port}")
-    if errors:
-        raise ConfigError("Speaker validation failed:\n  - " + "\n  - ".join(errors))
-
-
-def _parse_bool(value: Any) -> bool:
-    """A YAML or environment boolean ("true", "1", "yes", "on")."""
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("true", "1", "yes", "on")
-
-
-def _parse_quality_value(value: Any) -> int:
-    """Parse a quality value, handling 'auto' string -> AUTO_QUALITY (0)."""
-    if isinstance(value, str) and value.lower() == "auto":
-        return AUTO_QUALITY
-    return int(value)
-
-
-def _parse_yaml_speakers(raw_speakers: list[dict], config: Config) -> list[SpeakerConfig]:
-    """Parse a list of raw YAML dicts into SpeakerConfig objects."""
-    speakers = []
-    for raw in raw_speakers:
-        speaker = SpeakerConfig(
-            name=raw.get("name", "QobuzProxy"),
-            uuid=raw.get("uuid", ""),
-            device_type=parse_device_type(raw.get("device_type", DEFAULT_DEVICE_TYPE)),
-            backend_type=raw.get("backend", "dlna"),
-            max_quality=_parse_quality_value(raw.get("max_quality", 27)),
-            http_port=int(raw.get("http_port", 0)),
-            bind_address=raw.get("bind_address", config.server.bind_address),
-            dlna_ip=raw.get("dlna_ip", ""),
-            dlna_port=int(raw.get("dlna_port", 1400)),
-            dlna_fixed_volume=bool(raw.get("dlna_fixed_volume", False)),
-            dlna_description_url=raw.get("dlna_description_url", ""),
-            dlna_gapless=parse_gapless_mode(raw.get("dlna_gapless", "auto")),
-            dlna_udn=str(raw.get("dlna_udn", "") or ""),
-            proxy_port=int(raw.get("proxy_port", 0)),
-            audio_device=raw.get("audio_device", "default"),
-            audio_buffer_size=int(raw.get("audio_buffer_size", 2048)),
-            audio_fixed_volume=_parse_bool(raw.get("audio_fixed_volume", False)),
-        )
-        speakers.append(speaker)
-    return speakers
-
-
-def _split_env(var: str) -> list[str]:
-    """Split a comma-separated environment variable value into a list of strings."""
-    value = os.environ.get(var, "")
-    if not value:
-        return []
-    return [v.strip() for v in value.split(",")]
-
-
-def _split_env_padded(var: str, count: int, default: str) -> list[str]:
-    """
-    Split env var, broadcasting a single value to count items.
-
-    Raises:
-        ConfigError: If length is not 1 and not count.
-    """
-    values = _split_env(var)
-    if not values:
-        return [default] * count
-    if len(values) == 1:
-        return values * count
-    if len(values) != count:
-        raise ConfigError(f"Env var {var} has {len(values)} values but expected 1 or {count}")
-    return values
-
-
-def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
-    """Parse multi-speaker configuration from environment variables."""
-    names = _split_env("QOBUZPROXY_DEVICE_NAME")
-    if not names:
-        return []
-
-    count = len(names)
-
-    backend_types = _split_env_padded("QOBUZPROXY_BACKEND", count, "dlna")
-    device_types = _split_env_padded("QOBUZPROXY_DEVICE_TYPE", count, DEFAULT_DEVICE_TYPE)
-    dlna_ips = _split_env_padded("QOBUZPROXY_DLNA_IP", count, "")
-    dlna_ports_raw = _split_env_padded("QOBUZPROXY_DLNA_PORT", count, "1400")
-    dlna_fixed_volumes_raw = _split_env_padded("QOBUZPROXY_DLNA_FIXED_VOLUME", count, "false")
-    dlna_gapless_raw = _split_env_padded("QOBUZPROXY_DLNA_GAPLESS", count, "auto")
-    http_ports_raw = _split_env_padded("QOBUZPROXY_HTTP_PORT", count, "0")
-    proxy_ports_raw = _split_env_padded("QOBUZPROXY_PROXY_PORT", count, "0")
-    audio_devices = _split_env_padded("QOBUZPROXY_AUDIO_DEVICE", count, "default")
-    audio_buffer_sizes_raw = _split_env_padded("QOBUZPROXY_AUDIO_BUFFER_SIZE", count, "2048")
-    audio_fixed_raw = _split_env_padded("QOBUZPROXY_AUDIO_FIXED_VOLUME", count, "false")
-    qualities_raw = _split_env_padded("QOBUZ_MAX_QUALITY", count, "27")
-
-    speakers = []
-    for i, name in enumerate(names):
-        speaker = SpeakerConfig(
-            name=name,
-            device_type=parse_device_type(device_types[i]),
-            backend_type=backend_types[i],
-            max_quality=_parse_quality_value(qualities_raw[i]),
-            http_port=int(http_ports_raw[i]),
-            bind_address=config.server.bind_address,
-            dlna_ip=dlna_ips[i],
-            dlna_port=int(dlna_ports_raw[i]),
-            dlna_fixed_volume=_parse_bool(dlna_fixed_volumes_raw[i]),
-            dlna_gapless=parse_gapless_mode(dlna_gapless_raw[i]),
-            proxy_port=int(proxy_ports_raw[i]),
-            audio_device=audio_devices[i],
-            audio_buffer_size=int(audio_buffer_sizes_raw[i]),
-            audio_fixed_volume=_parse_bool(audio_fixed_raw[i]),
-        )
-        speakers.append(speaker)
-
-    return speakers
-
-
-def build_speaker_configs(
-    config: Config, raw_yaml_speakers: Optional[list[dict]] = None
-) -> list[SpeakerConfig]:
-    """
-    Build speaker configs from YAML, env vars, or flat config.
-
-    Priority: YAML speakers > comma-separated env vars > single flat config.
-    After building, assigns ports, generates UUIDs, and validates.
-    """
-    speakers: list[SpeakerConfig] = []
-
-    if raw_yaml_speakers is not None:
-        speakers = _parse_yaml_speakers(raw_yaml_speakers, config)
-    else:
-        env_speakers = _parse_env_speakers(config)
-        if env_speakers:
-            speakers = env_speakers
-        else:
-            # Only create a speaker from flat config if a backend is actually configured
-            has_backend = config.backend.dlna.ip or config.backend.type == "local"
-            if has_backend:
-                speakers = [_single_speaker_from_config(config)]
-
-    _assign_ports(speakers, webui_port=config.server.http_port)
-    _generate_uuids(speakers)
-    _validate_speakers(speakers)
-
-    return speakers
 
 
 def load_yaml_config(path: Path) -> dict:

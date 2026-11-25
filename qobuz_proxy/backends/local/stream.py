@@ -46,7 +46,7 @@ class AudioOutputStream:
 
         Closes existing stream if sample rate changed.
         """
-        import sounddevice as sd
+        import sounddevice as sd  # type: ignore[import-untyped]
 
         if self._stream is not None:
             if self._sample_rate == sample_rate and self._channels == channels:

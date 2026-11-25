@@ -26,7 +26,7 @@ class AudioDeviceInfo:
 def _import_sounddevice():
     """Lazy import of sounddevice."""
     try:
-        import sounddevice as sd
+        import sounddevice as sd  # type: ignore[import-untyped]
 
         return sd
     except ImportError:
