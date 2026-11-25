@@ -121,6 +121,7 @@ def assert_no_transport_writes(client):
         "seek",
         "play",
         "pause",
+        "pause_detailed",
         "stop",
         "set_av_transport_uri",
         "clear_queue",
@@ -311,7 +312,7 @@ async def test_current_and_gapless_qobuz_tracks_remain_controllable(rig, uri):
     await backend.pause()
     client.seek.assert_awaited_once_with(4000)
     client.play.assert_awaited_once()
-    client.pause.assert_awaited_once()
+    client.pause_detailed.assert_awaited_once()
     assert manager.is_renderer_active
 
 

@@ -18,6 +18,7 @@ Delete an entry to make qobuz-proxy probe that renderer again.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -28,8 +29,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 from qobuz_proxy.config import (  # noqa: F401 (re-exported)
     GAPLESS_AUTO,
     GAPLESS_MODES,
@@ -37,6 +36,12 @@ from qobuz_proxy.config import (  # noqa: F401 (re-exported)
     GAPLESS_ON,
     parse_gapless_mode,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# Behaviours tracked per renderer (profile, learned and user layers).
+_FIELDS = ("gapless", "stops_at_end", "reports_next_early", "can_pause")
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,11 @@ class ModelProfile:
     # Reports the queued URI as the current one as soon as it is queued,
     # while still playing the current track.
     reports_next_early: Optional[bool] = None
+    # Accepts Pause (some renderers advertise it but refuse it in practice).
+    can_pause: Optional[bool] = None
+    # Highest Qobuz quality the model plays, for renderers whose
+    # GetProtocolInfo lists FLAC without sample rates (5, 6, 7 or 27).
+    max_quality: Optional[int] = None
     notes: str = ""
 
 
@@ -74,6 +84,7 @@ PROFILES: tuple[ModelProfile, ...] = (
         model=_rx(r"\bk17\b"),
         gapless=False,
         stops_at_end=False,
+        max_quality=27,
         notes=(
             "DLNA firmware (Aug 2026): reported to start a queued "
             "SetNextAVTransportURI track at once, and to stay PLAYING with its "
@@ -88,10 +99,24 @@ PROFILES: tuple[ModelProfile, ...] = (
         model=_rx(r"\bsr11\b"),
         gapless=True,
         reports_next_early=True,
+        max_quality=27,
         notes=(
             "Plays gaplessly, but names the queued track as current as soon as "
             "it is queued (seen in Mandarin). Stays PLAYING at the end of a "
             "stream whose length it does not know."
+        ),
+    ),
+    ModelProfile(
+        id="bose-soundtouch",
+        label="Bose SoundTouch",
+        manufacturer=_rx(r"bose"),
+        model=_rx(r"soundtouch"),
+        gapless=False,
+        max_quality=6,
+        notes=(
+            "Refuses SetNextAVTransportURI (UPnP 401) and plays FLAC up to "
+            "16/48. Reports an empty CurrentURI while playing and a qplay:// "
+            "placeholder after Stop (GitHub #43)."
         ),
     ),
 )
@@ -112,19 +137,19 @@ class DeviceQuirks:
     gapless: Optional[bool] = None
     stops_at_end: Optional[bool] = None
     reports_next_early: Optional[bool] = None
+    can_pause: Optional[bool] = None
     sources: dict[str, str] = field(default_factory=dict)
     profile_id: Optional[str] = None
+    max_quality: Optional[int] = None
 
     def describe(self) -> str:
+        """One line per known behaviour and where it came from, for logs and the web UI."""
         parts = []
-        for name in ("gapless", "stops_at_end", "reports_next_early"):
+        for name in _FIELDS:
             value = getattr(self, name)
             if value is not None:
                 parts.append(f"{name}={value} ({self.sources.get(name, '?')})")
         return ", ".join(parts) or "spec defaults"
-
-
-_FIELDS = ("gapless", "stops_at_end", "reports_next_early")
 
 
 def _default_store_path() -> Path:
@@ -175,13 +200,27 @@ class QuirkStore:
         self._save()
         return True
 
+    def forget(self, udn: str) -> bool:
+        """Drop everything learned about one renderer; True if there was anything."""
+        entries = self._load()
+        if not udn or udn not in entries:
+            return False
+        del entries[udn]
+        self._save()
+        return True
+
     def _save(self) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".dlna_quirks.")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self._entries, f, indent=2, sort_keys=True)
-            os.replace(tmp, self._path)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._entries, f, indent=2, sort_keys=True)
+                os.replace(tmp, self._path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
         except OSError as e:
             # Learning still applies for this run; it just won't survive a restart.
             logger.warning(f"Could not save DLNA quirk store {self._path}: {e}")
@@ -199,6 +238,7 @@ def resolve_quirks(
     profile = profile_for(manufacturer, model)
     if profile:
         quirks.profile_id = profile.id
+        quirks.max_quality = profile.max_quality
         for name in _FIELDS:
             value = getattr(profile, name)
             if value is not None:

@@ -14,6 +14,7 @@ from aiohttp import web
 from zeroconf import ServiceInfo, Zeroconf
 
 from qobuz_proxy.config import Config
+from qobuz_proxy.net import interface_address
 
 from .types import ConnectTokens, JWTApiToken, JWTConnectToken
 
@@ -330,21 +331,5 @@ class DiscoveryService:
             logger.debug("Unregistered mDNS service")
 
     def _get_local_ip(self) -> Optional[str]:
-        """
-        Get the local IP address.
-
-        Uses a dummy socket connection to determine the outbound IP.
-        """
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0)
-            try:
-                # Doesn't actually connect, just determines route
-                s.connect(("8.8.8.8", 80))
-                ip = s.getsockname()[0]
-            finally:
-                s.close()
-            return str(ip)
-        except Exception as e:
-            logger.error(f"Failed to determine local IP: {e}")
-            return None
+        """The LAN address to advertise: the configured bind address, else the LAN IP."""
+        return interface_address(self.config.server.bind_address)

@@ -308,3 +308,55 @@ async def test_recovered_midstream_failure_is_not_a_delivery_failure():
         await upstream.stop()
 
     assert failures == []
+
+
+class ChunkedUpstream:
+    """Fake CDN that streams without Content-Length (chunked transfer)."""
+
+    def __init__(self):
+        self._runner = None
+
+    async def _handle(self, request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(status=200, headers={"Accept-Ranges": "bytes"})
+        resp.enable_chunked_encoding()
+        await resp.prepare(request)
+        await resp.write(PAYLOAD)
+        await resp.write_eof()
+        return resp
+
+    async def start(self) -> str:
+        app = web.Application()
+        app.router.add_get("/file", self._handle)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        port = _free_port()
+        await web.TCPSite(self._runner, "127.0.0.1", port).start()
+        return f"http://127.0.0.1:{port}/file"
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+
+async def test_chunked_upstream_keeps_a_known_length():
+    """A renderer must get Content-Length even when the CDN switches to chunked."""
+    upstream = ChunkedUpstream()
+    upstream_url = await upstream.start()
+    provider = MagicMock()
+    provider.get_streaming_url = AsyncMock(return_value=upstream_url)
+    port = _free_port()
+    proxy = AudioProxyServer(url_provider=provider, host="127.0.0.1", port=port)
+    await proxy.start()
+    requested: list = []
+    proxy.set_request_callback(requested.append)
+    try:
+        proxy.register_track("7", upstream_url, "audio/flac")
+        proxy._tracks["7"].size = len(PAYLOAD)  # learned from an earlier answer
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/audio/7.flac") as resp:
+                assert resp.headers.get("Content-Length") == str(len(PAYLOAD))
+                assert await resp.read() == PAYLOAD
+    finally:
+        await proxy.stop()
+        await upstream.stop()
+    assert requested == ["7"]

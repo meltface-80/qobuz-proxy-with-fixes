@@ -26,6 +26,10 @@ QOBUZ_QUALITY_192K = 27
 # gmediarender) and many others advertise the older "audio/x-flac".
 FLAC_MIME_TYPES = frozenset({"audio/flac", "audio/x-flac"})
 
+# Uncompressed PCM types and their bit depths.
+PCM_BIT_DEPTHS = {"audio/l16": 16, "audio/l24": 24, "audio/l32": 32}
+PCM_MIME_TYPES = frozenset(PCM_BIT_DEPTHS) | frozenset({"audio/wav", "audio/x-wav", "audio/wave"})
+
 # MIME types that indicate MP3 support.
 MP3_MIME_TYPES = frozenset({"audio/mpeg", "audio/mp3", "audio/x-mp3"})
 
@@ -132,6 +136,7 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
     caps = DLNACapabilities()
     if not sink:
         return caps
+    pcm_rates: list[tuple[int, int]] = []
 
     for raw_entry in sink.split(","):
         raw_entry = raw_entry.strip()
@@ -184,6 +189,10 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
                 caps.format_info_confirmed = True
         elif mime in MP3_MIME_TYPES:
             caps.supports_mp3 = True
+        elif mime in PCM_MIME_TYPES and (sr or bd):
+            pcm_rates.append((sr or 0, bd or 0))
+
+    _apply_pcm_evidence(caps, pcm_rates)
 
     # Log the audio formats we actually recognized, so capability-detection
     # issues (e.g. a FLAC device advertised under an unexpected MIME type) are
@@ -221,6 +230,27 @@ def parse_protocol_info_sink(sink: str) -> DLNACapabilities:
     return caps
 
 
+def _apply_pcm_evidence(caps: DLNACapabilities, pcm_rates: list[tuple[int, int]]) -> None:
+    """Use the PCM formats a renderer lists when its FLAC entries say nothing.
+
+    A renderer that takes 24-bit/192 kHz PCM has a DAC path for it; listing
+    FLAC without rates says nothing more about the decoder. Many renderers
+    (e.g. upmpdcli) list ``audio/L24;rate=...`` but a bare ``audio/flac``.
+    """
+    if not caps.supports_flac or caps.format_info_confirmed or not pcm_rates:
+        return
+    best_rate = max(rate for rate, _ in pcm_rates)
+    best_depth = max(depth for _, depth in pcm_rates)
+    if best_rate > caps.max_sample_rate or best_depth > caps.max_bit_depth:
+        caps.max_sample_rate = max(caps.max_sample_rate, best_rate)
+        caps.max_bit_depth = max(caps.max_bit_depth, best_depth)
+        caps.format_info_confirmed = True
+        logger.info(
+            "FLAC listed without rates; using the renderer's PCM formats "
+            f"({caps.max_bit_depth}bit/{caps.max_sample_rate}Hz)"
+        )
+
+
 def _parse_additional(s: str) -> dict[str, str]:
     """Parse DLNA additional info tokens."""
     tokens: dict[str, str] = {}
@@ -232,22 +262,32 @@ def _parse_additional(s: str) -> dict[str, str]:
 def _parse_format_params(
     content_format: str, additional: dict[str, str]
 ) -> tuple[Optional[int], Optional[int], Optional[int]]:
-    """Extract sample rate, bit depth, channels from format string or tokens."""
+    """Extract sample rate, bit depth, channels from format string or tokens.
+
+    Handles PCM types (``audio/L16;rate=44100;channels=2``, ``audio/L24``)
+    and the same parameters on other types (``audio/x-flac;rate=96000``),
+    plus vendor tokens in the additional-info field.
+    """
     sr: Optional[int] = None
     bd: Optional[int] = None
     ch: Optional[int] = None
 
-    # Check L16 params: audio/L16;rate=44100;channels=2
-    if "audio/l16" in content_format.lower():
-        bd = 16
-        for part in content_format.split(";")[1:]:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                k = k.strip().lower()
-                if k == "rate":
-                    sr = int(v.strip())
-                elif k == "channels":
-                    ch = int(v.strip())
+    mime = content_format.split(";")[0].strip().lower()
+    pcm_depth = PCM_BIT_DEPTHS.get(mime)
+    if pcm_depth:
+        bd = pcm_depth
+
+    for part in content_format.split(";")[1:]:
+        if "=" not in part:
+            continue
+        k, v = (x.strip() for x in part.split("=", 1))
+        k = k.lower()
+        if k in ("rate", "samplerate", "sample-rate"):
+            sr = _try_int(v)
+        elif k == "channels":
+            ch = _try_int(v)
+        elif k in ("bits", "bitspersample", "bitdepth", "bit-depth"):
+            bd = _try_int(v)
 
     # Check additional tokens for hints
     sr = sr or _try_int(additional.get("sampleRate") or additional.get("samplerate"))
@@ -286,10 +326,14 @@ def build_protocol_info(
     """
     entry = caps.best_entry_for_media(mime, sr, bd)
     if entry:
-        # Re-emit exact Sink entry for compatibility
-        add_str = (
-            ";".join(f"{k}={v}" for k, v in entry.additional.items()) if entry.additional else "*"
-        )
+        # Re-emit the Sink entry for compatibility. A bare entry ("*") carries
+        # no DLNA.ORG_OP, and some renderers then take the stream for a live
+        # one: Pause fails with 401 and Seek with 710 (NAD C 338, upstream
+        # #44/#45). The proxy serves byte ranges, so declare OP=01.
+        if entry.additional:
+            add_str = ";".join(f"{k}={v}" for k, v in entry.additional.items())
+        else:
+            add_str = "DLNA.ORG_OP=01"
         return f"{entry.protocol}:{entry.network}:{entry.content_format}:{add_str}"
     # Generic fallback
     return f"http-get:*:{mime}:DLNA.ORG_OP=01"

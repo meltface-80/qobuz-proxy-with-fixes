@@ -132,6 +132,20 @@ def parse_zone_group_state(soap_response: str) -> dict[str, SonosZoneMember] | N
         return None
 
 
+def zone_player_id(udn: str) -> str:
+    """The zone player ID in a Sonos UDN.
+
+    Discovery reports the UDN of the device holding AVTransport, which on
+    Sonos is the embedded MediaRenderer ("uuid:RINCON_xxx_MR"); the topology
+    lists the root zone player ("RINCON_xxx").
+    """
+    uid = udn.removeprefix("uuid:")
+    for suffix in ("_MR", "_MS"):
+        if uid.endswith(suffix):
+            return uid[: -len(suffix)]
+    return uid
+
+
 def enrich_discovered_devices(
     devices: list["DiscoveredDevice"],
     topology: dict[str, SonosZoneMember],
@@ -145,7 +159,7 @@ def enrich_discovered_devices(
     """
     result: list[DiscoveredDevice] = []
     for device in devices:
-        member = topology.get(device.udn.removeprefix("uuid:"))
+        member = topology.get(zone_player_id(device.udn))
         if member is None:
             result.append(device)
             continue

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from qobuz_proxy.backends.dlna import client as client_module
+from qobuz_proxy.backends.dlna import transport as client_module
 from qobuz_proxy.backends.dlna.client import DLNAClient
 
 
@@ -49,7 +49,7 @@ class TestSoapErrorReporting:
         with caplog.at_level("WARNING"):
             result = await client._soap_action_detailed(
                 "http://1.2.3.4/ctrl",
-                client_module.UPNP_AV_TRANSPORT,
+                "urn:schemas-upnp-org:service:AVTransport:1",
                 "Play",
                 {"InstanceID": "0"},
             )

@@ -231,3 +231,12 @@ class TestConnectLogging:
 
         assert connected is False
         assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+class TestDidlSize:
+    def test_size_included_when_known(self) -> None:
+        didl = _make_backend()._build_didl("http://p/t.flac", _make_metadata(), size=12345)
+        assert 'size="12345"' in didl
+
+    def test_no_size_attribute_when_unknown(self) -> None:
+        assert "size=" not in _make_backend()._build_didl("http://p/t.flac", _make_metadata())
