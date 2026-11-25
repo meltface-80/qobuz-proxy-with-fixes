@@ -152,7 +152,9 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=mock_speaker_instances) as MockSpeaker,
+            patch(
+                "qobuz_proxy.app_speakers.Speaker", side_effect=mock_speaker_instances
+            ) as MockSpeaker,
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -184,7 +186,7 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=[good, bad]),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[good, bad]),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -209,7 +211,7 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=[bad]),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[bad]),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -233,9 +235,9 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=[bad, still_bad, good]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[bad, still_bad, good]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -267,9 +269,9 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=[bad, duplicate]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[bad, duplicate]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -295,7 +297,7 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=[bad]),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[bad]),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -327,7 +329,7 @@ class TestMultiSpeakerOrchestration:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", side_effect=mock_instances),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=mock_instances),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -382,7 +384,7 @@ class TestGracefulStartup:
                 },
             ),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=mock_speaker),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -407,7 +409,7 @@ class TestGracefulStartup:
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.load_user_token") as mock_load_cache,
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=mock_speaker),
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
 
@@ -465,7 +467,7 @@ class TestWebUICallbacks:
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.load_user_token", return_value=None),
             patch("qobuz_proxy.app.QobuzAPIClient"),
-            patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=mock_speaker),
             patch("qobuz_proxy.app.save_user_token", return_value=True),
         ):
             app = QobuzProxy(config)
@@ -499,7 +501,7 @@ class TestWebUICallbacks:
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.load_user_token", return_value=None),
             patch("qobuz_proxy.app.QobuzAPIClient"),
-            patch("qobuz_proxy.app.Speaker", side_effect=[first, duplicate]),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[first, duplicate]),
             patch("qobuz_proxy.app.save_user_token", return_value=True),
         ):
             app = QobuzProxy(config)
@@ -527,7 +529,7 @@ class TestWebUICallbacks:
             patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
             patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
             patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
-            patch("qobuz_proxy.app.Speaker", return_value=mock_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=mock_speaker),
             patch("qobuz_proxy.app.clear_user_token") as mock_clear,
         ):
             MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
@@ -568,7 +570,7 @@ class TestSpeakerStartRaces:
         speaker.start = AsyncMock(side_effect=slow_start)
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=speaker),
             patch("qobuz_proxy.app.clear_user_token"),
         ):
             task = asyncio.create_task(app._start_speakers())
@@ -603,8 +605,8 @@ class TestSpeakerStartRaces:
         office = _make_mock_speaker("Office", starts=True)
 
         with (
-            patch("qobuz_proxy.app.Speaker", side_effect=[hanging, office]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[hanging, office]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
         ):
             app._schedule_speaker_retry(config.speakers[0])
             await retry_started.wait()
@@ -638,11 +640,11 @@ class TestSpeakerStartRaces:
         fresh = _make_mock_speaker("Test Speaker", starts=True)
 
         with (
-            patch("qobuz_proxy.app.Speaker", side_effect=[stale, fresh]),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[stale, fresh]),
             patch("qobuz_proxy.app.clear_user_token"),
             patch("qobuz_proxy.app.save_user_token", return_value=True),
             patch("qobuz_proxy.app.QobuzAPIClient"),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
         ):
             first = asyncio.create_task(app._start_speakers())
             await started.wait()
@@ -677,8 +679,8 @@ class TestSpeakerStartRaces:
         edited.get_status = MagicMock(return_value={"name": "Wyse"})
 
         with (
-            patch("qobuz_proxy.app.Speaker", side_effect=[hanging, edited]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[hanging, edited]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
             patch.object(QobuzProxy, "_save_config"),
         ):
             app._schedule_speaker_retry(config.speakers[0])
@@ -710,8 +712,8 @@ class TestSpeakerStartRaces:
         fresh = _make_mock_speaker("Test Speaker", starts=True)
 
         with (
-            patch("qobuz_proxy.app.Speaker", side_effect=[hanging, fresh]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[hanging, fresh]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
             patch("qobuz_proxy.app.clear_user_token"),
             patch("qobuz_proxy.app.save_user_token", return_value=True),
             patch("qobuz_proxy.app.QobuzAPIClient"),
@@ -743,7 +745,7 @@ class TestSpeakerStartRaces:
         speaker.start = AsyncMock(side_effect=slow_start)
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=speaker),
             patch.object(QobuzProxy, "_save_config"),
         ):
             task = asyncio.create_task(app._start_speakers())
@@ -788,8 +790,8 @@ class TestSpeakerStartRaces:
         edited.get_status = MagicMock(return_value={"name": "Office"})
 
         with (
-            patch("qobuz_proxy.app.Speaker", side_effect=[hanging, edited]),
-            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch("qobuz_proxy.app_speakers.Speaker", side_effect=[hanging, edited]),
+            patch("qobuz_proxy.app_speakers.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
             patch.object(QobuzProxy, "_save_config"),
         ):
             app._schedule_speaker_retry(config.speakers[1])
@@ -809,7 +811,7 @@ class TestSpeakerStartRaces:
         app._starting_speaker_ids.add("wyse")
 
         with (
-            patch("qobuz_proxy.app.Speaker") as MockSpeaker,
+            patch("qobuz_proxy.app_speakers.Speaker") as MockSpeaker,
             pytest.raises(ValueError, match="starting"),
         ):
             await app._on_edit_speaker("wyse", {"name": "Wyse"})
@@ -840,7 +842,7 @@ class TestSpeakerEditCallbacks:
         slow = _make_mock_speaker("Slow", starts=True)
         slow.start = AsyncMock(side_effect=slow_start)
 
-        with patch("qobuz_proxy.app.Speaker", side_effect=[fast, slow]):
+        with patch("qobuz_proxy.app_speakers.Speaker", side_effect=[fast, slow]):
             task = asyncio.create_task(app._start_speakers())
             await slow_started.wait()
             task.cancel()
@@ -852,9 +854,11 @@ class TestSpeakerEditCallbacks:
         assert app._speakers == []
 
     async def test_edit_persists_config_when_restart_fails(self):
-        """Edits must be saved even if the speaker can't start (e.g. device offline)."""
-        import pytest  # noqa: F401
+        """Edits are saved even if the speaker can't start (e.g. device offline).
 
+        GitHub #53: the failed instance must not count as running, and the
+        speaker keeps retrying so it comes up once the renderer is back.
+        """
         config = _make_config(_make_speaker_config(name="Wyse", max_quality=6))
         old_speaker = MagicMock()
         old_speaker.name = "Wyse"
@@ -868,10 +872,9 @@ class TestSpeakerEditCallbacks:
         new_speaker = MagicMock()
         new_speaker.name = "Wyse"
         new_speaker.start = AsyncMock(return_value=False)  # device unreachable
-        new_speaker.get_status.return_value = {"id": "wyse", "status": "disconnected"}
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=new_speaker),
             patch.object(app, "_save_config") as mock_save,
         ):
             result = await app._on_edit_speaker(
@@ -881,8 +884,13 @@ class TestSpeakerEditCallbacks:
         assert config.speakers[0].max_quality == 27
         assert config.speakers[0].dlna_ip == "192.168.1.60"
         mock_save.assert_called_once()
-        assert app._speakers[0] is new_speaker
-        assert result["status"] == "disconnected"
+        assert app._speakers == []
+        assert result["status"] == "starting"
+        assert "warning" in result
+        retry = app._speaker_retry_tasks.get("wyse")
+        assert retry is not None and not retry.done()
+        assert {s["status"] for s in app._speakers_for_api()} == {"starting"}
+        await app._stop_speakers()
 
     async def test_edit_toggles_fixed_volume(self):
         """The edit form exposes Fixed volume; the flag must round-trip and survive
@@ -903,7 +911,7 @@ class TestSpeakerEditCallbacks:
         new_speaker.get_status.return_value = {"id": "moode", "status": "idle"}
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=new_speaker) as mock_speaker_cls,
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=new_speaker) as mock_speaker_cls,
             patch.object(app, "_save_config"),
         ):
             await app._on_edit_speaker("moode", {"fixed_volume": True})
@@ -937,7 +945,7 @@ class TestSpeakerEditCallbacks:
         new_speaker.get_status.return_value = {"id": "moode", "status": "idle"}
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=new_speaker) as mock_speaker_cls,
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=new_speaker) as mock_speaker_cls,
             patch.object(app, "_save_config"),
         ):
             await app._on_edit_speaker("moode", {"device_type": "headphones"})
@@ -961,7 +969,7 @@ class TestSpeakerEditCallbacks:
         new_speaker.start = AsyncMock(return_value=True)
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=new_speaker),
             patch.object(app, "_save_config"),
         ):
             await app._on_add_speaker(
@@ -1023,7 +1031,7 @@ class TestSpeakerEditCallbacks:
         new_speaker.get_status.return_value = {"id": "speaker-b", "status": "idle"}
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=new_speaker),
             patch.object(app, "_save_config"),
         ):
             await app._on_edit_speaker("speaker-b", {"max_quality": 27})
@@ -1146,7 +1154,7 @@ class TestSpeakersApiListsConfig:
         speaker.get_status.return_value = {"id": "patio", "status": "disconnected"}
 
         with (
-            patch("qobuz_proxy.app.Speaker", return_value=speaker),
+            patch("qobuz_proxy.app_speakers.Speaker", return_value=speaker),
             patch.object(app, "_save_config") as mock_save,
             patch.object(app, "_schedule_speaker_retry") as mock_retry,
         ):

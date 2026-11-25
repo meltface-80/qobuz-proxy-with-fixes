@@ -113,6 +113,19 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_state_update_with_sentinel_queue_item(self, codec: ProtocolCodec) -> None:
+        """Upstream #44: the all-ones "no item" id must not break state reports."""
+        frame = codec.encode_state_update(
+            playing_state=2,
+            buffer_state=2,
+            position_ms=0,
+            duration_ms=0,
+            queue_item_id=0xFFFFFFFFFFFFFFFF,
+            queue_version_major=1,
+            queue_version_minor=0,
+        )
+        assert frame[0] == MessageType.PAYLOAD
+
     def test_encode_join_session(self, codec: ProtocolCodec, device_uuid: bytes) -> None:
         """Test join session message encoding."""
         session_uuid = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes

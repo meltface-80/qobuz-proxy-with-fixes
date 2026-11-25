@@ -11,7 +11,7 @@ import contextlib
 import logging
 import os
 import signal
-from typing import Any, Optional
+from typing import Optional
 
 from aiohttp import web
 
@@ -24,61 +24,19 @@ from qobuz_proxy.auth import (
     save_user_token,
 )
 from qobuz_proxy.auth.oauth import OAUTH_APP_ID, OAUTH_APP_SECRET
-from qobuz_proxy.config import (
-    AUTO_QUALITY,
-    Config,
-    ConfigError,
-    SpeakerConfig,
-    _assign_ports,
-    _generate_uuids,
-    parse_device_type,
-    parse_gapless_mode,
-    slugify_name,
+from qobuz_proxy.app_speaker_edits import SpeakerEditMixin
+from qobuz_proxy.app_speakers import (  # noqa: F401 (re-exported)
+    SPEAKER_RETRY_DELAYS_SECONDS,
+    SPEAKER_RETRY_STEADY_DELAY_SECONDS,
+    ConfigSaveError,
 )
+from qobuz_proxy.config import Config
 from qobuz_proxy.speaker import Speaker
-from qobuz_proxy.webui.config_writer import persist_speaker_uuids, save_config
+from qobuz_proxy.webui.config_writer import persist_speaker_uuids
 from qobuz_proxy.webui.routes import register_routes
 
 logger = logging.getLogger(__name__)
 
-
-def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
-    """API status for a config entry that is not currently running."""
-    config_dict: dict = {
-        "max_quality": "auto" if sc.max_quality == AUTO_QUALITY else sc.max_quality,
-        "device_type": sc.device_type,
-    }
-    if sc.backend_type == "dlna":
-        config_dict["dlna_ip"] = sc.dlna_ip
-        config_dict["dlna_port"] = sc.dlna_port
-        config_dict["description_url"] = sc.dlna_description_url
-        config_dict["fixed_volume"] = sc.dlna_fixed_volume
-        config_dict["gapless"] = sc.dlna_gapless
-    elif sc.backend_type == "local":
-        config_dict["audio_device"] = sc.audio_device
-        config_dict["buffer_size"] = sc.audio_buffer_size
-    return {
-        "id": slugify_name(sc.name),
-        "name": sc.name,
-        "backend": sc.backend_type,
-        "status": status,
-        "config": config_dict,
-        "now_playing": None,
-    }
-
-
-def _parse_body_device_type(value: Any) -> str:
-    """Parse a device type from a web UI request body (ValueError -> HTTP 400)."""
-    try:
-        return parse_device_type(value)
-    except ConfigError as e:
-        raise ValueError(str(e)) from e
-
-
-# Backoff schedule for speakers that fail to start (renderer offline, boot
-# races between containers). After the ramp, keep trying at a steady pace.
-SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
-SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 
 # Backoff for validating the saved token at startup. Qobuz's login endpoint
 # can be slow or unreachable while the network is still coming up (Docker
@@ -88,7 +46,7 @@ AUTH_RETRY_DELAYS_SECONDS: tuple[float, ...] = (3.0, 8.0, 20.0, 40.0, 60.0)
 AUTH_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 
 
-class QobuzProxy:
+class QobuzProxy(SpeakerEditMixin):
     """
     Main QobuzProxy application.
 
@@ -414,251 +372,6 @@ class QobuzProxy:
         clear_user_token()
 
     # ------------------------------------------------------------------
-    # Speaker management (hot add / edit / remove)
-    # ------------------------------------------------------------------
-
-    async def _on_add_speaker(self, body: dict) -> dict:
-        """Add a new speaker at runtime."""
-        name = body["name"].strip()
-        backend_type = body.get("backend", "dlna")
-
-        # Check for duplicate names against the config — a speaker can exist in
-        # config without running (e.g. its device is offline), and a duplicate
-        # name in the saved config prevents the app from booting.
-        new_id = slugify_name(name)
-        for sc_existing in self._config.speakers:
-            if slugify_name(sc_existing.name) == new_id:
-                raise ValueError(f"Speaker '{name}' already exists")
-
-        # Build SpeakerConfig
-        quality_raw = body.get("max_quality", "auto")
-        if isinstance(quality_raw, str) and quality_raw.lower() == "auto":
-            max_quality = AUTO_QUALITY
-        else:
-            max_quality = int(quality_raw)
-
-        sc = SpeakerConfig(
-            name=name,
-            device_type=_parse_body_device_type(body.get("device_type")),
-            backend_type=backend_type,
-            max_quality=max_quality,
-            dlna_ip=body.get("dlna_ip", ""),
-            dlna_port=int(body.get("dlna_port", 1400)),
-            dlna_fixed_volume=bool(body.get("fixed_volume", False)),
-            dlna_description_url=body.get("description_url", ""),
-            dlna_gapless=parse_gapless_mode(body.get("gapless", "auto")),
-            audio_device=body.get("audio_device", "default"),
-            audio_buffer_size=int(body.get("buffer_size", 2048)),
-        )
-
-        assert self._api_client is not None
-
-        # Assign ports against every configured speaker, including ones that
-        # failed to start — otherwise a hot-add can collide with their ports.
-        all_configs = list(self._config.speakers) + [sc]
-        _assign_ports(all_configs, webui_port=self._config.server.http_port)
-        _generate_uuids([sc])
-
-        # Persist first so a restart still has this speaker even if start fails.
-        self._config.speakers.append(sc)
-        self._save_config()
-
-        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
-        epoch = self._speakers_epoch
-        self._starting_speaker_ids.add(new_id)
-        try:
-            started = await speaker.start()
-        finally:
-            self._starting_speaker_ids.discard(new_id)
-        if started and await self._adopt_started_speaker(speaker, sc, epoch):
-            return speaker.get_status()
-
-        logger.warning(f"Speaker '{name}' saved but failed to start — retrying in background")
-        self._schedule_speaker_retry(sc)
-        status = _configured_speaker_status(sc, "starting")
-        status["warning"] = "Configuration saved, but the speaker failed to start"
-        return status
-
-    async def _on_edit_speaker(self, speaker_id: str, body: dict) -> dict:
-        """Edit a speaker at runtime (stop, reconfigure, restart).
-
-        The new config is persisted even when the speaker fails to restart —
-        edits are often the fix for connectivity (e.g. a changed device IP),
-        so refusing to save them would lock the user out of recovering.
-        """
-        # Match the config entry by name: the running list and the config list
-        # can be misaligned when some speakers failed to start.
-        config_idx = None
-        for i, sc in enumerate(self._config.speakers):
-            if slugify_name(sc.name) == speaker_id:
-                config_idx = i
-                break
-        if config_idx is None:
-            raise KeyError(speaker_id)
-
-        speaker_idx = None
-        for i, s in enumerate(self._speakers):
-            if slugify_name(s.name) == speaker_id:
-                speaker_idx = i
-                break
-
-        old_config = self._config.speakers[config_idx]
-
-        new_name = body.get("name", old_config.name).strip()
-        new_id = slugify_name(new_name)
-        if new_id != speaker_id:
-            for i, sc in enumerate(self._config.speakers):
-                if i != config_idx and slugify_name(sc.name) == slugify_name(new_name):
-                    raise ValueError(f"Speaker '{new_name}' already exists")
-
-        quality_raw = body.get("max_quality", old_config.max_quality)
-        if isinstance(quality_raw, str) and quality_raw.lower() == "auto":
-            max_quality = AUTO_QUALITY
-        else:
-            max_quality = int(quality_raw)
-
-        new_config = SpeakerConfig(
-            name=new_name,
-            uuid=old_config.uuid,
-            device_type=_parse_body_device_type(body.get("device_type", old_config.device_type)),
-            backend_type=old_config.backend_type,  # Immutable
-            max_quality=max_quality,
-            http_port=old_config.http_port,
-            bind_address=old_config.bind_address,
-            dlna_ip=body.get("dlna_ip", old_config.dlna_ip),
-            dlna_port=int(body.get("dlna_port", old_config.dlna_port)),
-            dlna_fixed_volume=bool(body.get("fixed_volume", old_config.dlna_fixed_volume)),
-            dlna_description_url=body.get("description_url", old_config.dlna_description_url),
-            dlna_gapless=parse_gapless_mode(body.get("gapless", old_config.dlna_gapless)),
-            proxy_port=old_config.proxy_port,
-            audio_device=body.get("audio_device", old_config.audio_device),
-            audio_buffer_size=int(body.get("buffer_size", old_config.audio_buffer_size)),
-        )
-
-        # The edited speaker replaces any pending boot retry of the old config.
-        # Wait for an attempt in flight to unwind so its reservation is gone:
-        # editing a speaker whose renderer is unreachable is the usual fix.
-        retry_task = self._speaker_retry_tasks.pop(speaker_id, None)
-        if retry_task is not None and not retry_task.done():
-            retry_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await retry_task
-            # Speakers may have been removed or renamed while waiting: find the
-            # entries again so the edit doesn't overwrite another speaker.
-            config_idx = next(
-                (
-                    i
-                    for i, sc in enumerate(self._config.speakers)
-                    if slugify_name(sc.name) == speaker_id
-                ),
-                None,
-            )
-            if config_idx is None:
-                raise KeyError(speaker_id)
-            if new_id != speaker_id and any(
-                i != config_idx and slugify_name(sc.name) == new_id
-                for i, sc in enumerate(self._config.speakers)
-            ):
-                raise ValueError(f"Speaker '{new_name}' already exists")
-            speaker_idx = next(
-                (i for i, s in enumerate(self._speakers) if slugify_name(s.name) == speaker_id),
-                None,
-            )
-        if {speaker_id, new_id} & self._starting_speaker_ids:
-            # A login is starting it right now; a second instance would fight
-            # it for the same ports.
-            raise ValueError(f"Speaker '{old_config.name}' is starting; try again in a moment")
-
-        # Persist first: the edit is saved even if the restart below fails
-        self._config.speakers[config_idx] = new_config
-        self._save_config()
-
-        epoch = self._speakers_epoch
-        reserved = {speaker_id, new_id}
-        self._starting_speaker_ids |= reserved
-        try:
-            if speaker_idx is not None:
-                old_speaker = self._speakers.pop(speaker_idx)
-                await old_speaker.stop()
-
-            assert self._api_client is not None
-            new_speaker = Speaker(
-                config=new_config, api_client=self._api_client, app_id=self._app_id
-            )
-            started = await new_speaker.start()
-        finally:
-            self._starting_speaker_ids -= reserved
-        # Kept even when the start failed, so the web UI shows its status
-        await self._adopt_started_speaker(new_speaker, new_config, epoch)
-
-        status = new_speaker.get_status()
-        if not started:
-            logger.warning(
-                f"Speaker '{new_config.name}' failed to start with new config "
-                "(configuration saved anyway)"
-            )
-            status["warning"] = "Configuration saved, but the speaker failed to start"
-        return status
-
-    async def _on_remove_speaker(self, speaker_id: str) -> None:
-        """Remove a speaker at runtime."""
-        # Match the config entry by name: the running list and the config list
-        # can be misaligned when some speakers failed to start, so the running
-        # index must not be used to pop from the config list.
-        config_idx = None
-        for i, sc in enumerate(self._config.speakers):
-            if slugify_name(sc.name) == speaker_id:
-                config_idx = i
-                break
-        if config_idx is None:
-            raise KeyError(speaker_id)
-
-        speaker_idx = None
-        for i, s in enumerate(self._speakers):
-            if slugify_name(s.name) == speaker_id:
-                speaker_idx = i
-                break
-
-        self._config.speakers.pop(config_idx)
-        self._cancel_speaker_retry(speaker_id)
-        if speaker_idx is not None:
-            speaker = self._speakers.pop(speaker_idx)
-            await speaker.stop()
-
-        self._save_config()
-
-    def _save_config(self) -> None:
-        """Persist current config to YAML file."""
-        if self._config.config_path:
-            try:
-                save_config(self._config, self._config.config_path)
-            except Exception as e:
-                logger.error(f"Failed to save config: {e}")
-
-    def _speakers_for_api(self) -> list[dict]:
-        """Return every configured speaker, with live status when running.
-
-        The web UI used to list only ``_speakers`` (successfully started
-        instances). After a restart, config-backed speakers that had not yet
-        come up looked deleted — while re-adding the same name failed because
-        they were still in ``_config.speakers``.
-        """
-        running = {slugify_name(s.name): s.get_status() for s in self._speakers}
-        retrying = {
-            sid for sid, task in self._speaker_retry_tasks.items() if task and not task.done()
-        }
-        result: list[dict] = []
-        for sc in self._config.speakers:
-            sid = slugify_name(sc.name)
-            if sid in running:
-                result.append(running[sid])
-            elif sid in retrying:
-                result.append(_configured_speaker_status(sc, "starting"))
-            else:
-                result.append(_configured_speaker_status(sc, "disconnected"))
-        return result
-
-    # ------------------------------------------------------------------
     # Web server
     # ------------------------------------------------------------------
 
@@ -677,6 +390,8 @@ class QobuzProxy:
         self._web_app["on_add_speaker"] = self._on_add_speaker
         self._web_app["on_edit_speaker"] = self._on_edit_speaker
         self._web_app["on_remove_speaker"] = self._on_remove_speaker
+        self._web_app["on_forget_speaker_quirks"] = self._on_forget_speaker_quirks
+        self._web_app["bind_address"] = self._config.server.bind_address
         self._web_app["local_audio_enabled"] = os.environ.get(
             "QOBUZPROXY_LOCAL_AUDIO_UI", ""
         ).lower() in ("true", "1", "yes")
@@ -702,207 +417,3 @@ class QobuzProxy:
             await self._web_site.stop()
         if self._web_runner:
             await self._web_runner.cleanup()
-
-    # ------------------------------------------------------------------
-    # Speaker lifecycle
-    # ------------------------------------------------------------------
-
-    async def _start_speakers(self) -> None:
-        """Create and start Speaker instances from config.
-
-        Speakers that fail to start (e.g. the renderer is still booting or
-        temporarily unreachable) are retried in the background instead of
-        being dropped until the next restart.
-        """
-        assert self._api_client is not None
-
-        if not self._config.speakers:
-            port = self._config.server.http_port
-            logger.info(f"No speakers configured — add speakers at http://localhost:{port}")
-            return
-
-        configs = [sc for sc in self._config.speakers if not self._speaker_active(sc.name)]
-        if not configs:
-            return  # All running, or being started by another login or retry
-
-        speakers = [
-            Speaker(
-                config=sc,
-                api_client=self._api_client,
-                app_id=self._app_id,
-            )
-            for sc in configs
-        ]
-
-        epoch = self._speakers_epoch
-        reserved = {slugify_name(sc.name) for sc in configs}
-        self._starting_speaker_ids |= reserved
-        tasks = [asyncio.ensure_future(s.start()) for s in speakers]
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            # Cancelled mid-start (shutdown, or a web UI login/logout racing the
-            # background token validation): let the starts unwind, then release
-            # whatever came up so a later start doesn't find the ports taken.
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.gather(*[s.stop() for s in speakers], return_exceptions=True)
-            raise
-        finally:
-            self._starting_speaker_ids -= reserved
-
-        for sc, speaker, result in zip(configs, speakers, results):
-            if isinstance(result, BaseException) or result is False:
-                reason = f": {result}" if isinstance(result, BaseException) else ""
-                if epoch != self._speakers_epoch:
-                    self._retry_after_stale_start(sc)  # Only if logged in again
-                    continue
-                logger.warning(
-                    f"Speaker '{speaker.name}' failed to start{reason} — retrying in background"
-                )
-                self._schedule_speaker_retry(sc)
-            else:
-                await self._adopt_started_speaker(speaker, sc, epoch)
-
-        if epoch != self._speakers_epoch:
-            return  # Stopped while starting (logout or shutdown)
-
-        if not self._speakers:
-            logger.error(
-                "No speakers started successfully — retrying in background; "
-                "check configuration and logs"
-            )
-            return
-
-        names = ", ".join(s.name for s in self._speakers)
-        port = self._config.server.http_port
-        logger.info(f"qobuz-proxy ready — {len(self._speakers)} speaker(s): {names}")
-        logger.info(f"Web UI: http://localhost:{port}")
-
-    def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
-        """Start (or keep) a background task retrying a failed speaker."""
-        speaker_id = slugify_name(config.name)
-        existing = self._speaker_retry_tasks.get(speaker_id)
-        if existing and not existing.done():
-            return
-        self._speaker_retry_tasks[speaker_id] = asyncio.create_task(self._retry_speaker(config))
-
-    def _cancel_speaker_retry(self, speaker_id: str) -> None:
-        """Stop retrying a speaker (it was edited, removed, or is shutting down)."""
-        task = self._speaker_retry_tasks.pop(speaker_id, None)
-        if task:
-            task.cancel()
-
-    async def _retry_speaker(self, config: SpeakerConfig) -> None:
-        """Retry starting a speaker with backoff until it comes up.
-
-        Renderers routinely boot slower than qobuz-proxy (sibling Docker
-        containers, powered-off devices), so a failed start must not drop
-        the speaker until the next restart.
-        """
-
-        def retry_delay(attempt: int) -> float:
-            if attempt < len(SPEAKER_RETRY_DELAYS_SECONDS):
-                return SPEAKER_RETRY_DELAYS_SECONDS[attempt]
-            return SPEAKER_RETRY_STEADY_DELAY_SECONDS
-
-        speaker_id = slugify_name(config.name)
-        attempt = 0
-        try:
-            while True:
-                await asyncio.sleep(retry_delay(attempt))
-                attempt += 1
-
-                if self._api_client is None:
-                    return  # Logged out — speakers restart on the next login
-
-                if any(slugify_name(s.name) == speaker_id for s in self._speakers):
-                    return  # Started meanwhile by another path (e.g. a second login)
-                if speaker_id in self._starting_speaker_ids:
-                    continue  # Another path is starting it; check again next round
-
-                speaker = Speaker(config=config, api_client=self._api_client, app_id=self._app_id)
-                epoch = self._speakers_epoch
-                self._starting_speaker_ids.add(speaker_id)
-                try:
-                    started = await speaker.start()
-                except asyncio.CancelledError:
-                    await speaker.stop()
-                    raise
-                except Exception as e:
-                    logger.debug(f"Speaker '{config.name}' retry raised: {e}")
-                    started = False
-                finally:
-                    self._starting_speaker_ids.discard(speaker_id)
-
-                if started:
-                    if await self._adopt_started_speaker(speaker, config, epoch):
-                        logger.info(
-                            f"Speaker '{config.name}' started after {attempt} retry attempt(s)"
-                        )
-                    return
-
-                logger.info(
-                    f"Speaker '{config.name}' still failing to start "
-                    f"(attempt {attempt}) — next retry in {retry_delay(attempt):.0f}s"
-                )
-        finally:
-            self._speaker_retry_tasks.pop(speaker_id, None)
-
-    def _speaker_active(self, name: str) -> bool:
-        """Whether a speaker is running or has a start in progress."""
-        speaker_id = slugify_name(name)
-        return speaker_id in self._starting_speaker_ids or any(
-            slugify_name(s.name) == speaker_id for s in self._speakers
-        )
-
-    async def _adopt_started_speaker(
-        self, speaker: Speaker, config: SpeakerConfig, epoch: int
-    ) -> bool:
-        """Add a just-started speaker to the running list.
-
-        If the speakers were stopped while it was starting (logout, shutdown),
-        or its config entry was removed or replaced meanwhile, it is stopped
-        instead, so no speaker outlives a logout or its own config.
-        """
-        if not any(sc is config for sc in self._config.speakers):
-            logger.info(f"Speaker '{speaker.name}' was removed or edited while starting; releasing")
-            await speaker.stop()
-            return False
-        if epoch != self._speakers_epoch:
-            logger.info(f"Speaker '{speaker.name}' came up after speakers were stopped; releasing")
-            await speaker.stop()
-            self._retry_after_stale_start(config)
-            return False
-        self._speakers.append(speaker)
-        return True
-
-    def _retry_after_stale_start(self, config: SpeakerConfig) -> None:
-        """Restart a speaker whose start straddled a logout and a new login.
-
-        The new login skipped it because this start still held its reservation,
-        so without a retry it would stay stopped until the next login.
-        """
-        if self._api_client is None or not self._is_running:
-            return  # Logged out or shutting down; the next login starts it
-        if any(sc is config for sc in self._config.speakers):
-            self._schedule_speaker_retry(config)
-
-    async def _stop_speakers(self) -> None:
-        """Stop all running speakers and any pending start retries.
-
-        Starts still in flight (a login or a speaker edit) release their speaker
-        when they finish, because the epoch changes here.
-        """
-        self._speakers_epoch += 1
-        retries = list(self._speaker_retry_tasks.values())
-        for task in retries:
-            task.cancel()
-        self._speaker_retry_tasks.clear()
-        # Let cancelled attempts unwind (stop their half-started speaker and drop
-        # their reservation) before returning, so a login right after a logout
-        # doesn't skip a speaker whose old attempt still looks like it's starting.
-        await asyncio.gather(*retries, return_exceptions=True)
-
-        if self._speakers:
-            await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)
-            self._speakers = []

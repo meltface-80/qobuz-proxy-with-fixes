@@ -17,6 +17,10 @@ from qobuz_proxy.proto import common as common_pb2
 logger = logging.getLogger(__name__)
 
 
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
+
+
 class MessageType(IntEnum):
     """Outer envelope message types."""
 
@@ -232,7 +236,13 @@ class ProtocolCodec:
         state.currentPosition.CopyFrom(position)
 
         state.duration = duration_ms
-        state.currentQueueItemId = queue_item_id
+        # currentQueueItemId is an int32. The app's "no item" sentinel
+        # (2**64 - 1) made every state report fail with "Value out of range"
+        # (upstream #44); leave the field out instead of dropping the report.
+        if INT32_MIN <= queue_item_id <= INT32_MAX:
+            state.currentQueueItemId = queue_item_id
+        else:
+            logger.debug(f"Not reporting out-of-range queue item id {queue_item_id}")
 
         queue_ver = common_pb2.QueueVersion()
         queue_ver.major = queue_version_major

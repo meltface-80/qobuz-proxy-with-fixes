@@ -515,6 +515,11 @@ class QobuzPlayer:
                 return
 
             if self._playback_permission_check and not await self._playback_permission_check():
+                # Logged: a silent refusal looked like a dead speaker (#36).
+                logger.info(
+                    "SET_STATE ignored: the renderer is busy or playing another source; "
+                    "select the speaker again in the Qobuz app to take it back"
+                )
                 return
             if gen != self._command_generation:
                 return

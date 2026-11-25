@@ -60,7 +60,7 @@ class TestDiscoverDLNA:
         ) as mock_discover:
             resp = await client.post("/api/discover/dlna", json={"timeout": 10})
             assert resp.status == 200
-            mock_discover.assert_awaited_once_with(timeout=10.0)
+            mock_discover.assert_awaited_once_with(timeout=10.0, bind_address="0.0.0.0")
 
     async def test_discover_empty(self, client: TestClient) -> None:
         with patch(
@@ -183,3 +183,51 @@ class TestSpeakerCRUD:
         client.app["on_remove_speaker"] = AsyncMock(side_effect=KeyError("not-found"))
         resp = await client.delete("/api/speakers/not-found")
         assert resp.status == 404
+
+
+class TestEditValidationAndSaveErrors:
+    """GitHub #54: edits are validated like adds; failed saves are reported."""
+
+    async def test_edit_rejects_empty_dlna_ip(self, client: TestClient) -> None:
+        resp = await client.put("/api/speakers/living-room", json={"dlna_ip": "  "})
+        assert resp.status == 400
+        client.app["on_edit_speaker"].assert_not_called()
+
+    async def test_edit_rejects_empty_name(self, client: TestClient) -> None:
+        resp = await client.put("/api/speakers/living-room", json={"name": ""})
+        assert resp.status == 400
+
+    async def test_failed_save_is_an_error_not_a_success(self, client: TestClient) -> None:
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        client.app["on_edit_speaker"].side_effect = ConfigSaveError("disk full")
+        resp = await client.put("/api/speakers/living-room", json={"max_quality": 6})
+        assert resp.status == 500
+        assert "disk full" in (await resp.json())["error"]
+
+        client.app["on_add_speaker"].side_effect = ConfigSaveError("read-only")
+        resp = await client.post("/api/speakers", json={"name": "A", "dlna_ip": "10.0.0.1"})
+        assert resp.status == 500
+
+        client.app["on_remove_speaker"].side_effect = ConfigSaveError("read-only")
+        resp = await client.delete("/api/speakers/a")
+        assert resp.status == 500
+
+    async def test_forget_quirks(self, client: TestClient) -> None:
+        resp = await client.post("/api/speakers/a/forget-quirks")
+        assert resp.status == 404  # no callback wired in this app
+        client.app["on_forget_speaker_quirks"] = AsyncMock(return_value={"id": "a"})
+        resp = await client.post("/api/speakers/a/forget-quirks")
+        assert resp.status == 200
+
+    async def test_discovery_timeout_is_bounded(self, client: TestClient) -> None:
+        with patch(
+            "qobuz_proxy.webui.speaker_routes.discover_dlna_devices",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as mock_discover:
+            resp = await client.post("/api/discover/dlna", json={"timeout": 600})
+            assert resp.status == 200
+            assert mock_discover.await_args.kwargs["timeout"] == 15.0
+            resp = await client.post("/api/discover/dlna", json={"timeout": "x"})
+            assert resp.status == 400
