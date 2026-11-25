@@ -21,13 +21,15 @@ QobuzProxy solves this by acting as a virtual Qobuz Connect device on your netwo
 - Local audio playback via PortAudio (play directly through your machine's speakers/DAC)
 - **Web UI for speaker management** — discover, add, edit, and remove speakers from your browser
 - **Device icons** — choose how each speaker looks in the Qobuz app (speaker, soundbar, headphones, TV, ...)
-- Auto-detects device capabilities to select optimal audio quality
+- Auto-detects device capabilities to select optimal audio quality, with built-in profiles for renderers that under-report them
+- Learns each DLNA renderer's quirks (gapless support, end-of-track behaviour, pause support) and remembers them per device
+- Finds a renderer again by its UPnP UDN when its IP address changes
 - Zero-config startup — boot with no config file, set everything up from the web UI
 - Runs on Raspberry Pi, Docker, or any Linux/macOS system
 
 ## Audio Quality
 
-By default (`max_quality: auto`), QobuzProxy queries your DLNA device's capabilities and automatically selects the best supported quality. You can also set a specific quality level:
+By default (`max_quality: auto`), QobuzProxy queries your DLNA device's capabilities and automatically selects the best supported quality. Renderers that list FLAC without sample rates fall back to the PCM formats they list, then to a built-in model profile (see [docs/dlna-renderers.md](docs/dlna-renderers.md)), and only then to CD quality. You can also set a specific quality level:
 
 | Value | Format |
 |-------|--------|
@@ -50,6 +52,8 @@ docker run -d --network host \
 ```
 
 Note: The `--device /dev/snd` flag gives the container access to the host's audio devices (Linux only). Qobuz credentials should be in your `data/config.yaml`.
+
+To keep the output at 100% and control volume on your DAC or amp instead (no digital attenuation), set `QOBUZPROXY_AUDIO_FIXED_VOLUME=true`, `audio_fixed_volume: true` for the speaker, or tick "Fixed volume" in the web UI.
 
 ## Installation
 
@@ -182,6 +186,16 @@ If you cannot use host networking, consider:
 QobuzProxy registers discovery on the interface whose IPv4 address it advertises.
 It does not join multicast groups on every Docker bridge, so hosts with many
 containers do not need a higher multicast membership limit for Qobuz discovery.
+That interface is `bind_address` when set, else the LAN address; a VPN tunnel
+holding the default route is skipped. DLNA (SSDP) discovery uses the same
+interface.
+
+If multicast does not reach your renderers (Docker bridge networks, VLANs),
+list them in `QOBUZPROXY_DLNA_HOSTS` (comma-separated `ip`, `ip:port` or
+description URLs). They get a direct search and description fetch.
+
+See [docs/dlna-renderers.md](docs/dlna-renderers.md) for how renderers are
+discovered and how their behaviour is detected.
 
 ### Configuration
 

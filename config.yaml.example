@@ -28,9 +28,12 @@ backend:
     # gapless: auto             # auto, on or off. auto: known models and what the
                                 # renderer is seen to do decide (saved per device in
                                 # dlna_quirks.json in the data directory)
+    # udn: ""                   # Renderer UPnP UDN; saved automatically, used to find
+                                # the renderer again if its IP address changes
   # local:
   #   device: "default"         # Audio device name or "default"
   #   buffer_size: 2048         # Audio buffer size in frames
+  #   fixed_volume: false       # Keep output at 100%, ignore volume commands
 
 server:
   http_port: 8689               # mDNS discovery HTTP server
@@ -65,8 +68,14 @@ logging:
 #     dlna_ip: "192.168.1.51"
 #     max_quality: 7
 #     # dlna_gapless: off        # auto (default), on or off
+#     # dlna_udn: "uuid:..."     # saved automatically after the first connect
 #
 #   - name: "Headphones"
 #     backend: local
 #     audio_device: "Built-in Output"
 #     device_type: headphones    # optional, icon in the Qobuz app (default: speaker)
+#     # audio_fixed_volume: true # keep output at 100% (volume set on the DAC/amp)
+#
+# --- DLNA discovery without multicast ---
+# Renderers that SSDP multicast does not reach (Docker bridges, VLANs):
+#   QOBUZPROXY_DLNA_HOSTS=192.168.20.5,192.168.20.6:49152

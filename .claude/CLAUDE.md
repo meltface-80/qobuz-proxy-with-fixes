@@ -57,7 +57,7 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 2. **Connect** (`connect/`): Registers as mDNS device + HTTP discovery endpoints (`discovery.py`), manages WebSocket connection to Qobuz servers (`ws_manager.py`), encodes/decodes protobuf messages (`protocol.py`)
 3. **Playback** (`playback/`): State machine player (`player.py`), queue management (`queue.py`), track metadata from Qobuz API (`metadata.py`), command handlers (`command_handler.py`, `queue_handler.py`, `volume_handler.py`), periodic state reporting to Qobuz app (`state_reporter.py`)
 4. **Backend** (`backends/`): Abstract `AudioBackend` interface (`base.py`), factory/registry pattern (`factory.py`). Two implementations:
-   - **DLNA** (`dlna/`): SOAP/UPnP client (`client.py`), device capability detection (`capabilities.py`), audio proxy server (`proxy_server.py`)
+   - **DLNA** (`dlna/`): SOAP/UPnP client (`client.py`, with `transport.py`, `soap.py`, `description.py`, `sonos_queue.py`), SSDP discovery (`discovery.py`), device capability detection (`capabilities.py`), renderer quirks — model profiles + behaviour learned per UDN (`quirks.py`), audio proxy server (`proxy_server.py`, `proxy_stream.py`, `proxy_http.py`), UPnP event subscriptions (`events.py`). `DLNABackend` is a linear chain of layers: `backend_base.py` → `ownership.py` (takeover detection) → `gapless.py` → `track_end.py` → `polling.py` → `backend.py`. See `docs/dlna-renderers.md`.
    - **Local** (`local/`): Downloads FLAC, decodes to float32, plays via PortAudio (`backend.py`), ring buffer for streaming (`ring_buffer.py`), sounddevice output stream (`stream.py`). Optional deps: `sounddevice`, `numpy`, `soundfile`
 
 ### Key Data Flows
@@ -72,17 +72,18 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 
 ### Quality Auto-Detection
 
-When `max_quality: auto`: DLNA `GetProtocolInfo` → `capabilities.py` parses Sink string → maps to Qobuz quality (27=Hi-Res 192k, 7=Hi-Res 96k, 6=CD, 5=MP3). Falls back to CD quality (6) on failure.
+When `max_quality: auto`: DLNA `GetProtocolInfo` → `capabilities.py` parses Sink string → maps to Qobuz quality (27=Hi-Res 192k, 7=Hi-Res 96k, 6=CD, 5=MP3). FLAC listed without rates falls back to the listed PCM rates, then to a model profile's `max_quality` (`quirks.py`), then to CD quality (6).
 
 ## Configuration Priority
 
 1. CLI arguments (highest) → 2. Environment variables → 3. YAML config file → 4. Code defaults
 
-Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`
+Key env vars: `QOBUZ_AUTH_TOKEN`, `QOBUZ_USER_ID`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_DLNA_GAPLESS`, `QOBUZPROXY_DLNA_HOSTS` (renderers searched directly when multicast does not reach them), `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_AUDIO_FIXED_VOLUME`, `QOBUZPROXY_LOG_LEVEL`
 
 ## Code Style
 
-- **Ruff** for both formatting (`ruff format`) and linting, 100 char line length, **mypy** strict
+- **Ruff** for both formatting (`ruff format`) and linting, 100 char line length, **mypy** strict (protoc-generated `qobuz_proxy/proto/` is excluded)
+- **No file over 500 lines** (source, tests, JS and CSS; generated protobuf excepted). Split by responsibility; keep old import paths working with re-exports
 - Type hints required on all public functions, Google-style docstrings only for non-obvious APIs
 - All I/O is async. No blocking calls in main event loop
 - Never log passwords or auth tokens
@@ -127,6 +128,7 @@ The protocol uses `Position { timestamp: fixed64, value: uint32 }`. The app inte
 1. **Position always 0**: DLNA device may not support `GetPositionInfo` for the current source
 2. **State not updating**: `_playback_monitor_loop` only polls when `_state == PlaybackState.PLAYING`
 3. **Protocol encoding**: Log values passed to `encode_state_update()` — binary issues are invisible otherwise
+4. **Gapless or track ends wrong on one renderer**: check `Renderer behaviour` in the web UI edit form (or the `Renderer behaviour:` / `Learned ...` log lines) and `dlna_quirks.json` in the data directory; the web UI's Re-detect clears what was learned
 
 ### Reproducing issues before fixing
 
