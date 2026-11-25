@@ -8,7 +8,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends import PlaybackState, BufferStatus
 
@@ -81,7 +81,7 @@ class PlaybackStateReport:
 
 
 # Type alias for send callback
-SendCallback = Callable[["PlaybackStateReport"], "asyncio.Future[None]"]
+SendCallback = Callable[["PlaybackStateReport"], Awaitable[None]]
 
 
 class StateReporter:

@@ -86,16 +86,16 @@ class PlayerBase:
         self._playback_permission_check: Optional[Callable[[], Awaitable[bool]]] = None
 
         # State reporting - supports both callback and StateReporter
-        self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
+        self._state_update_callback: Optional[Callable[[], Awaitable[object]]] = None
         self._state_reporter: Optional["StateReporter"] = None
 
         # Volume
         self._volume: int = 50  # Cached volume level (0-100)
         self._fixed_volume: bool = False  # From config
-        self._volume_report_callback: Optional[Callable[[int], asyncio.Future]] = None
+        self._volume_report_callback: Optional[Callable[[int], Awaitable[object]]] = None
 
         # File quality report callback - called when track starts playing
-        self._file_quality_report_callback: Optional[Callable[[int], asyncio.Future]] = None
+        self._file_quality_report_callback: Optional[Callable[[int], Awaitable[object]]] = None
 
         # Next track callback - used when track ends to get the next track from SET_STATE
         self._get_next_track_callback: Optional[Callable[[], Optional[dict]]] = None
@@ -126,7 +126,7 @@ class PlayerBase:
     # Callback Registration
     # =========================================================================
 
-    def set_state_update_callback(self, callback: Callable[[], asyncio.Future]) -> None:
+    def set_state_update_callback(self, callback: Callable[[], Awaitable[object]]) -> None:
         """Set callback to send state updates to app (legacy method)."""
         self._state_update_callback = callback
 
@@ -139,11 +139,13 @@ class PlayerBase:
         """
         self._state_reporter = reporter
 
-    def set_volume_report_callback(self, callback: Callable[[int], asyncio.Future]) -> None:
+    def set_volume_report_callback(self, callback: Callable[[int], Awaitable[object]]) -> None:
         """Set callback to report volume changes to app."""
         self._volume_report_callback = callback
 
-    def set_file_quality_report_callback(self, callback: Callable[[int], asyncio.Future]) -> None:
+    def set_file_quality_report_callback(
+        self, callback: Callable[[int], Awaitable[object]]
+    ) -> None:
         """Set callback to report file quality when track starts playing."""
         self._file_quality_report_callback = callback
 
