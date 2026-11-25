@@ -10,6 +10,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, Optional
+from urllib.parse import urljoin
 
 import aiohttp
 from aiohttp import ClientTimeout
@@ -661,6 +662,7 @@ class DLNAClient:
 
         xml_text = None
         base_url = None
+        doc_url = ""
 
         # 1. Try the SSDP LOCATION URL directly (authoritative source)
         if self.description_url:
@@ -670,6 +672,7 @@ class DLNAClient:
                         xml_text = await response.text()
                         parsed = urlparse(self.description_url)
                         base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"
+                        doc_url = self.description_url
                         logger.debug(f"Found device description at {self.description_url}")
             except Exception as e:
                 logger.debug(f"SSDP location {self.description_url} failed: {e}")
@@ -692,6 +695,7 @@ class DLNAClient:
                         if response.status == 200:
                             xml_text = await response.text()
                             base_url = f"http://{self.ip}:{self.port}"
+                            doc_url = url
                             logger.debug(f"Found device description at {url}")
                             break
                 except Exception as e:
@@ -701,14 +705,29 @@ class DLNAClient:
         if not xml_text:
             raise DLNAClientError(f"Could not find device description for {self.ip}:{self.port}")
 
-        return self._parse_device_description(xml_text, base_url or "")
+        return self._parse_device_description(xml_text, base_url or "", doc_url)
 
-    def _parse_device_description(self, xml_text: str, base_url: str) -> DLNADeviceInfo:
+    def _parse_device_description(
+        self, xml_text: str, base_url: str, doc_url: str = ""
+    ) -> DLNADeviceInfo:
         """Parse device description XML."""
         info = DLNADeviceInfo()
 
         try:
             root = ET.fromstring(xml_text)
+
+            # Relative control URLs resolve against URLBase when the device
+            # gives one, else against the description document's own URL
+            # (UPnP Device Architecture 1.0, 2.1). Plain base_url + path only
+            # worked for paths starting with "/".
+            url_base = ""
+            for elem in root:
+                if elem.tag.split("}")[-1] == "URLBase" and elem.text:
+                    url_base = elem.text.strip()
+            anchor = url_base or doc_url or (base_url + "/" if base_url else "")
+
+            def resolve(control_url: str) -> str:
+                return urljoin(anchor, control_url) if anchor else control_url
 
             # Find device element (handle namespaces)
             for elem in root.iter():
@@ -739,26 +758,17 @@ class DLNAClient:
                         control_url = child.text or ""
 
                 if "AVTransport" in service_type and control_url:
-                    if control_url.startswith("/"):
-                        info.av_transport_url = base_url + control_url
-                    else:
-                        info.av_transport_url = control_url
+                    info.av_transport_url = resolve(control_url)
 
                 elif "RenderingControl" in service_type and control_url:
                     # Prefer standard RenderingControl over GroupRenderingControl
                     # GroupRenderingControl is Sonos-specific and uses different API
                     is_standard = "GroupRenderingControl" not in service_type
                     if is_standard or not info.rendering_control_url:
-                        if control_url.startswith("/"):
-                            info.rendering_control_url = base_url + control_url
-                        else:
-                            info.rendering_control_url = control_url
+                        info.rendering_control_url = resolve(control_url)
 
                 elif "ConnectionManager" in service_type and control_url:
-                    if control_url.startswith("/"):
-                        info.connection_manager_url = base_url + control_url
-                    else:
-                        info.connection_manager_url = control_url
+                    info.connection_manager_url = resolve(control_url)
 
         except ET.ParseError as e:
             logger.error(f"Failed to parse device description: {e}")

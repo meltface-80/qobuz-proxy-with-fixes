@@ -31,6 +31,41 @@ READ_TIMEOUT_SECONDS = 30
 MAX_UPSTREAM_RETRIES = 3
 UPSTREAM_RETRY_DELAY_SECONDS = 0.5
 
+# DLNA streaming headers, sent only when the renderer asks for them
+# (getcontentFeatures.dlna.org / transferMode.dlna.org request headers).
+# OP=01: byte-range seeking; FLAGS: streaming transfer mode, DLNA 1.5.
+DLNA_CONTENT_FEATURES = (
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+)
+
+
+def _dlna_headers(request: web.Request) -> Dict[str, str]:
+    """DLNA headers a renderer asked for in its request."""
+    headers: Dict[str, str] = {}
+    if request.headers.get("getcontentFeatures.dlna.org", "").strip() == "1":
+        headers["contentFeatures.dlna.org"] = DLNA_CONTENT_FEATURES
+    if request.headers.get("transferMode.dlna.org"):
+        headers["transferMode.dlna.org"] = "Streaming"
+    return headers
+
+
+def _reaches_end_of_file(
+    status: int,
+    content_range: Optional[str],
+    expected_bytes: Optional[int],
+    bytes_sent: int,
+) -> bool:
+    """Whether a completed response carried the file through to its last byte."""
+    if status == 206:
+        # "bytes 1000-49999/50000": the range ends at the file's last byte.
+        try:
+            span, total = (content_range or "").split(" ", 1)[1].split("/", 1)
+            end = int(span.split("-", 1)[1])
+            return total.strip() != "*" and end + 1 == int(total)
+        except (IndexError, ValueError):
+            return False
+    return expected_bytes is None or bytes_sent >= expected_bytes
+
 
 def _parse_range_start(range_header: str) -> int:
     """Extract the start byte from a Range header ("bytes=X-...")."""
@@ -103,6 +138,7 @@ class AudioProxyServer:
 
         self._tracks: Dict[str, RegisteredTrack] = {}
         self._on_delivery_failure: Optional[Callable[[str, bool], None]] = None
+        self._on_delivery_complete: Optional[Callable[[str], None]] = None
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -195,6 +231,21 @@ class AudioProxyServer:
         """
         self._on_delivery_failure = callback
 
+    def set_delivery_complete_callback(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(proxy_key)`` for a track sent through to its last byte.
+
+        Lets the backend tell a renderer that has the whole file (and is
+        only playing out its buffer) from one still waiting for audio.
+        """
+        self._on_delivery_complete = callback
+
+    def _report_delivery_complete(self, proxy_key: str) -> None:
+        if self._on_delivery_complete:
+            try:
+                self._on_delivery_complete(proxy_key)
+            except Exception as e:
+                logger.error(f"Delivery complete callback error: {e}")
+
     def _report_delivery_failure(self, proxy_key: str, before_audio: bool) -> None:
         if self._on_delivery_failure:
             try:
@@ -247,7 +298,9 @@ class AudioProxyServer:
         # the body just to have aiohttp discard it downloads the whole track
         # from the CDN.
         if request.method == "HEAD":
-            return await self._handle_head_probe(track)
+            response = await self._handle_head_probe(track)
+            response.headers.update(_dlna_headers(request))
+            return response
 
         # Forward request to Qobuz CDN
         return await self._proxy_stream(request, track, proxy_key)
@@ -305,6 +358,8 @@ class AudioProxyServer:
 
         response: Optional[web.StreamResponse] = None
         expected_bytes: Optional[int] = None
+        response_status = 200
+        content_range: Optional[str] = None
         is_range = range_header is not None
         stream_start = time.monotonic()
         bytes_sent = 0
@@ -373,6 +428,7 @@ class AudioProxyServer:
                             response_headers: Dict[str, str] = {
                                 "Content-Type": track.content_type,
                                 "Accept-Ranges": "bytes",
+                                **_dlna_headers(request),
                             }
                             if "Content-Length" in upstream_response.headers:
                                 cl = upstream_response.headers["Content-Length"]
@@ -382,6 +438,8 @@ class AudioProxyServer:
                                 response_headers["Content-Range"] = upstream_response.headers[
                                     "Content-Range"
                                 ]
+                                content_range = response_headers["Content-Range"]
+                            response_status = status
 
                             logger.debug(
                                 f"Streaming track {track.track_id}, headers: {response_headers}"
@@ -419,6 +477,8 @@ class AudioProxyServer:
                     is_range=is_range,
                     completed=True,
                 )
+                if _reaches_end_of_file(response_status, content_range, expected_bytes, bytes_sent):
+                    self._report_delivery_complete(proxy_key)
                 return response
 
             except asyncio.CancelledError:

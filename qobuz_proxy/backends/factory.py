@@ -80,6 +80,7 @@ class BackendFactory:
                 ip=config.backend.dlna.ip,
                 port=config.backend.dlna.port or 1400,
                 description_url=description_url,
+                gapless=config.backend.dlna.gapless,
             )
         elif backend_type == "local":
             return await cls.create_local(
@@ -98,6 +99,7 @@ class BackendFactory:
         fixed_volume: bool = False,
         name: Optional[str] = None,
         description_url: Optional[str] = None,
+        gapless: str = "auto",
     ) -> AudioBackend:
         """
         Create a DLNA backend.
@@ -108,6 +110,7 @@ class BackendFactory:
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
+            gapless: "auto", "on" or "off" (see backends/dlna/quirks.py)
 
         Returns:
             Connected DLNABackend instance
@@ -121,6 +124,7 @@ class BackendFactory:
             fixed_volume=fixed_volume,
             name=name,
             description_url=description_url,
+            gapless=gapless,
         )
         if await backend.connect():
             return backend

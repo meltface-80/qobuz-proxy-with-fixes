@@ -27,6 +27,14 @@ from .capabilities import (
     apply_device_overrides,
     build_protocol_info,
 )
+from .quirks import (
+    GAPLESS_AUTO,
+    DeviceQuirks,
+    QuirkStore,
+    default_store as _default_quirk_store,
+    parse_gapless_mode,
+    resolve_quirks,
+)
 
 if TYPE_CHECKING:
     from .proxy_server import AudioProxyServer
@@ -50,6 +58,46 @@ PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 # (another controller or the device's own buttons stopped it). Covers the poll
 # interval plus renderers whose reported position lags a little.
 EARLY_STOP_MARGIN_MS = 15_000
+
+# Gapless arming waits until the renderer itself has been heard playing the
+# current track: some renderers replace a track that is still loading with a
+# NextURI that arrives during TRANSITIONING. Confirmed once the reported
+# position reaches ARM_AFTER_POSITION_MS, or (for renderers that never report
+# a position) after PLAYING has been seen for ARM_AFTER_PLAYING_SECONDS.
+ARM_AFTER_POSITION_MS = 3_000
+ARM_AFTER_PLAYING_SECONDS = 4.0
+
+# A renderer that stays PLAYING at the end of a track (position parked at the
+# track length, never STOPPED). The track counts as ended when its position is
+# within END_WINDOW_MS of the length and has not moved for:
+#   END_STALL_DELIVERED_SECONDS  the proxy has sent the whole file
+#   END_STALL_KNOWN_SECONDS      the renderer is known not to report STOPPED
+#   END_STALL_SECONDS            otherwise
+# or once the position runs PAST_END_MS beyond the length.
+END_WINDOW_MS = 2_000
+END_STALL_DELIVERED_SECONDS = 2.0
+END_STALL_KNOWN_SECONDS = 4.0
+END_STALL_SECONDS = 6.0
+PAST_END_MS = 4_000
+# A position counts as "not moving" while it stays within this of where the
+# stall started (RelTime is reported in whole seconds).
+STALL_TOLERANCE_MS = 500
+
+# A renderer that starts the queued track as soon as it gets it: with a next
+# track armed and the current URI unchanged, the position falls back by at
+# least EARLY_SWITCH_BACK_MS to the start of a track (at most
+# EARLY_SWITCH_TO_MS) while plenty of the current one was left. Arming waits
+# for ARM_AFTER_POSITION_MS, so the jump back is visible even when the switch
+# follows the arming at once.
+EARLY_SWITCH_BACK_MS = 2_000
+EARLY_SWITCH_TO_MS = 3_000
+EARLY_SWITCH_REMAINING_MS = 15_000
+# Our own seeks also move the position back; ignore jumps this soon after one.
+SEEK_SETTLE_SECONDS = 5.0
+
+# A stop at the end of a track with a next track armed this long before it
+# means the renderer ignores SetNextAVTransportURI.
+IGNORED_NEXT_ARMED_FOR_SECONDS = 10.0
 
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
@@ -99,6 +147,8 @@ class DLNABackend(AudioBackend):
         fixed_volume: bool = False,
         name: Optional[str] = None,
         description_url: Optional[str] = None,
+        gapless: str = GAPLESS_AUTO,
+        quirk_store: Optional[QuirkStore] = None,
     ):
         """
         Initialize DLNA backend.
@@ -109,6 +159,8 @@ class DLNABackend(AudioBackend):
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
+            gapless: "auto" (profile and learned behaviour decide), "on" or "off"
+            quirk_store: Where learned renderer behaviour is kept (tests)
         """
         super().__init__(name or f"DLNA ({ip})")
         self._ip = ip
@@ -149,6 +201,30 @@ class DLNABackend(AudioBackend):
         self._next_track_queue_nr: Optional[int] = None  # Sonos queue position of armed track
         self._gapless_supported: bool = True
         self._current_proxy_url: Optional[str] = None
+        # When the armed next track was sent to the renderer (monotonic).
+        self._next_armed_at: float = 0.0
+
+        # Renderer behaviour: built-in profile, learned, and the user's setting.
+        self._gapless_mode = parse_gapless_mode(gapless)
+        self._quirk_store = quirk_store if quirk_store is not None else _default_quirk_store
+        self._quirks = DeviceQuirks()
+        # Logged once per track when the renderer names the armed URI early.
+        self._early_uri_logged_for: Optional[str] = None
+
+        # Whether the renderer has been heard playing the current track (gates
+        # gapless arming), and when PLAYING was first seen for it.
+        self._playing_confirmed = False
+        self._first_playing_at: Optional[float] = None
+
+        # End-of-track stall tracking for renderers that never report STOPPED.
+        self._stall_position_ms: int = -1
+        self._stall_since: float = 0.0
+        # Proxy keys whose whole file the proxy has sent to the renderer.
+        self._delivered_keys: set[str] = set()
+        # When we last asked the renderer to seek (monotonic).
+        self._last_seek_at: float = 0.0
+        # The track URL a stalled end was already reported for.
+        self._end_handled_for: Optional[str] = None
 
         # Sonos queue-based playback (for Sonos app metadata display)
         self._is_sonos: bool = False
@@ -289,7 +365,12 @@ class DLNABackend(AudioBackend):
         """
         self._proxy_server = proxy
         proxy.set_delivery_failure_callback(self._on_delivery_failure)
+        proxy.set_delivery_complete_callback(self._on_delivery_complete)
         logger.info("Audio proxy server configured for DLNA backend")
+
+    def _on_delivery_complete(self, proxy_key: str) -> None:
+        """Remember a track whose whole file the renderer has received."""
+        self._delivered_keys.add(proxy_key)
 
     def _on_delivery_failure(self, proxy_key: str, before_audio: bool) -> None:
         """Remember a track the renderer could not get (fully) from the proxy."""
@@ -314,6 +395,7 @@ class DLNABackend(AudioBackend):
 
             # Query device capabilities
             await self._discover_capabilities(device_info)
+            self._apply_quirks(device_info)
 
             self._is_connected = True
 
@@ -337,6 +419,83 @@ class DLNABackend(AudioBackend):
         except Exception as e:
             logger.error(f"Unexpected error connecting to DLNA: {e}", exc_info=True)
             return False
+
+    def _apply_quirks(self, device_info) -> None:
+        """Resolve profile, learned and user behaviour for this renderer."""
+        self._quirks = resolve_quirks(
+            device_info.udn,
+            device_info.manufacturer,
+            device_info.model_name,
+            self._gapless_mode,
+            self._quirk_store,
+        )
+        # Sonos gapless goes through its own queue, not SetNextAVTransportURI.
+        if not self._is_sonos:
+            self._gapless_supported = self._quirks.gapless is not False
+        logger.info(
+            "[%s] Renderer behaviour: %s; gapless %s",
+            self.name,
+            self._quirks.describe(),
+            "on" if self._gapless_supported else "off",
+        )
+
+    def _learn(self, name: str, value: bool, reason: str) -> None:
+        """Apply and save a behaviour this renderer has just shown."""
+        if self._quirks.sources.get(name) == "user":
+            return  # the user's setting stands
+        changed = getattr(self._quirks, name) != value
+        setattr(self._quirks, name, value)
+        self._quirks.sources[name] = "learned"
+        device_info = getattr(self._client, "device_info", None)
+        udn = getattr(device_info, "udn", "") or ""
+        saved = self._quirk_store.learn(udn, name, value, label=self.name)
+        if changed or saved:
+            logger.warning(
+                "[%s] Learned %s=%s: %s%s",
+                self.name,
+                name,
+                value,
+                reason,
+                f" (saved to {self._quirk_store.path})" if saved else "",
+            )
+        if name == "gapless" and value is False and not self._is_sonos:
+            self._gapless_supported = False
+
+    def _reset_track_tracking(self) -> None:
+        """Forget per-track observations when a new track starts."""
+        self._playing_confirmed = False
+        self._first_playing_at = None
+        self._stall_position_ms = -1
+        self._stall_since = 0.0
+        self._early_uri_logged_for = None
+        self._end_handled_for = None
+
+    @property
+    def quirks(self) -> DeviceQuirks:
+        """Effective renderer behaviour (profile, learned and user layers)."""
+        return self._quirks
+
+    @property
+    def ready_for_next_track(self) -> bool:
+        """Whether a next track may be armed now.
+
+        Only once the renderer has been heard playing the current track:
+        arming while it is still loading makes some renderers play the queued
+        track instead.
+        """
+        return self._gapless_supported and (self._is_sonos or self._playing_confirmed)
+
+    def _note_playing(self, position_ms: Optional[int]) -> None:
+        """Confirm the current track is playing on the renderer."""
+        if self._playing_confirmed:
+            return
+        now = time.monotonic()
+        if self._first_playing_at is None:
+            self._first_playing_at = now
+        if (position_ms or 0) >= ARM_AFTER_POSITION_MS or (
+            now - self._first_playing_at >= ARM_AFTER_PLAYING_SECONDS
+        ):
+            self._playing_confirmed = True
 
     async def _discover_capabilities(self, device_info) -> None:
         """Query and parse device capabilities."""
@@ -435,6 +594,7 @@ class DLNABackend(AudioBackend):
             logger.debug(f"Using proxy URL: {actual_url}")
         # Failures from an earlier attempt at this URL are not this play's.
         self._delivery_failures.pop(_proxy_key(actual_url), None)
+        self._delivered_keys.discard(_proxy_key(actual_url))
 
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
@@ -453,6 +613,7 @@ class DLNABackend(AudioBackend):
             self._current_proxy_url = actual_url
             self._playback_started_at = time.monotonic()
             self._loading_after_playing = False
+            self._reset_track_tracking()
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
@@ -575,6 +736,8 @@ class DLNABackend(AudioBackend):
         if not await self._owns_transport():
             raise RuntimeError("Cannot seek: renderer is not playing the Qobuz track")
         if self._client and await self._client.seek(position_ms):
+            self._last_seek_at = time.monotonic()
+            self._stall_position_ms = -1
             self._position_ms = position_ms
             self._furthest_position_ms = position_ms
             self._notify_position_update(position_ms)
@@ -709,7 +872,7 @@ class DLNABackend(AudioBackend):
         self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
     ) -> bool:
         """Prepare the next track for gapless transition."""
-        if not self._client or not self._gapless_supported or not await self._owns_transport():
+        if not self._client or not self.ready_for_next_track or not await self._owns_transport():
             return False
 
         # Determine content type
@@ -729,6 +892,7 @@ class DLNABackend(AudioBackend):
             )
             logger.debug(f"Gapless: registered next track proxy URL: {actual_url}")
         self._delivery_failures.pop(_proxy_key(actual_url), None)
+        self._delivered_keys.discard(_proxy_key(actual_url))
 
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
@@ -755,6 +919,7 @@ class DLNABackend(AudioBackend):
         if result.success:
             self._next_track_proxy_url = actual_url
             self._next_track_metadata = metadata
+            self._next_armed_at = time.monotonic()
             logger.info(f"Gapless: armed next track: {metadata.artist} - {metadata.title}")
             return True
 
@@ -763,6 +928,11 @@ class DLNABackend(AudioBackend):
             logger.warning(
                 f"Gapless: disabled — device does not support SetNextAVTransportURI "
                 f"(error {result.error_code}: {result.error_description})"
+            )
+            self._learn(
+                "gapless",
+                False,
+                f"SetNextAVTransportURI refused with error {result.error_code}",
             )
         else:
             logger.warning(
@@ -831,7 +1001,11 @@ class DLNABackend(AudioBackend):
                         current_uri = await self._client.get_track_uri()
                     else:
                         current_uri = await self._client.get_media_info()
-                    if current_uri and current_uri == self._next_track_proxy_url:
+                    if (
+                        current_uri
+                        and current_uri == self._next_track_proxy_url
+                        and (self._is_sonos or await self._moved_on_to_next())
+                    ):
                         logger.info("Gapless: transition detected — device moved to next track")
                         # Update state to reflect the new track
                         self._current_metadata = self._next_track_metadata
@@ -842,6 +1016,9 @@ class DLNABackend(AudioBackend):
                         self._furthest_position_ms = 0
                         self._playback_started_at = time.monotonic()
                         self._loading_after_playing = False
+                        self._reset_track_tracking()
+                        # Already heard playing: the following track may be armed.
+                        self._playing_confirmed = True
                         # Clear gapless state — the armed entry is now the
                         # playing one, so don't remove it from the queue
                         self._next_track_proxy_url = None
@@ -894,6 +1071,11 @@ class DLNABackend(AudioBackend):
                             continue  # Skip state update entirely
 
                         # If gapless was armed but device stopped, clear and fall through
+                        armed_for = (
+                            time.monotonic() - self._next_armed_at
+                            if self._next_track_proxy_url and not self._is_sonos
+                            else 0.0
+                        )
                         if self._next_track_proxy_url:
                             logger.debug(
                                 "Gapless: device stopped despite armed next track, "
@@ -902,7 +1084,17 @@ class DLNABackend(AudioBackend):
                             self._next_track_proxy_url = None
                             self._next_track_metadata = None
 
-                        if self._stopped_before_track_end():
+                        early_stop = self._stopped_before_track_end()
+                        # Armed well before the end and not taken: the
+                        # renderer ignores SetNextAVTransportURI.
+                        if not early_stop and armed_for >= IGNORED_NEXT_ARMED_FOR_SECONDS:
+                            self._learn(
+                                "gapless",
+                                False,
+                                "stopped at the end of a track with the next one queued",
+                            )
+
+                        if early_stop:
                             logger.info(
                                 "[%s] Renderer stopped at %s of %s without a Qobuz command; "
                                 "not a track end, so not advancing",
@@ -919,13 +1111,208 @@ class DLNABackend(AudioBackend):
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:
+                    furthest_before = self._furthest_position_ms
                     pos = await self.get_position()
+                    self._note_playing(pos)
+
+                    if self._switched_early(furthest_before, pos):
+                        await self._recover_from_early_switch(furthest_before)
+                        continue
+
+                    if self._ended_without_stop(pos):
+                        self._handle_end_without_stop(pos)
+                        continue
+
                     self._notify_position_update(pos)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
+
+    # =========================================================================
+    # Renderer quirks: early URI, early switch, no STOPPED at the end
+    # =========================================================================
+
+    async def _moved_on_to_next(self) -> bool:
+        """Whether a renderer naming the armed URI has really moved on to it.
+
+        Some renderers (FiiO SR11) report the queued URI as current as soon as
+        it is queued, while still playing the current track. Believe the
+        change only when the position went back to the start of a track, or
+        the current track was in its last seconds.
+        """
+        if not self._client:
+            return True
+        pos = await self._client.get_position_info()
+        duration = self._duration_ms
+        before = self._furthest_position_ms
+        if not isinstance(pos, int) or duration <= 0 or before <= 0:
+            # Nothing to judge by (no duration, or a renderer that never
+            # reported a position for this track): trust the URI, as before.
+            return True
+        back_margin = min(5_000, duration // 3)
+        went_back = pos + back_margin < before
+        if self._quirks.reports_next_early:
+            # Known to name the next track early: only a return to the
+            # start of a track counts, even in the last seconds.
+            if went_back and pos < min(15_000, duration // 3):
+                return True
+        elif went_back or before >= duration - min(15_000, duration // 3):
+            return True
+
+        # Still on the current track.
+        self._position_ms = pos
+        self._furthest_position_ms = max(self._furthest_position_ms, pos)
+        if self._early_uri_logged_for != self._next_track_proxy_url:
+            self._early_uri_logged_for = self._next_track_proxy_url
+            logger.info(
+                "[%s] Renderer names the queued track at %s of %s; "
+                "keeping the current track until it ends",
+                self.name,
+                _format_ms(pos),
+                _format_ms(duration),
+            )
+            self._learn(
+                "reports_next_early",
+                True,
+                "named the queued track as current before reaching it",
+            )
+        return False
+
+    def _switched_early(self, furthest_before: int, pos: int) -> bool:
+        """Whether the renderer started the armed track as soon as it got it.
+
+        The current URI is unchanged (no transition was seen), yet the
+        position fell back to the start of a track with plenty of the current
+        one left: the queued track is playing under the current one's name.
+        """
+        if self._is_sonos or not self._next_track_proxy_url:
+            return False
+        now = time.monotonic()
+        if (
+            now - self._last_seek_at < SEEK_SETTLE_SECONDS
+            or now - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS
+        ):
+            return False
+        remaining = self._duration_ms - furthest_before if self._duration_ms > 0 else None
+        return (
+            pos <= EARLY_SWITCH_TO_MS
+            and pos + EARLY_SWITCH_BACK_MS <= furthest_before
+            and (remaining is None or remaining >= EARLY_SWITCH_REMAINING_MS)
+        )
+
+    async def _recover_from_early_switch(self, resume_ms: int) -> None:
+        """Turn gapless off for this renderer and put the current track back."""
+        logger.warning(
+            "[%s] Renderer started the queued track at %s into the current one",
+            self.name,
+            _format_ms(resume_ms),
+        )
+        self._learn("gapless", False, "starts a queued track as soon as it is queued")
+        self._next_track_proxy_url = None
+        self._next_track_metadata = None
+        self._next_track_queue_nr = None
+        if self._quirks.sources.get("gapless") == "user":
+            logger.warning(
+                "[%s] Gapless is forced on for this speaker; set it to auto or off "
+                "to stop this renderer skipping ahead",
+                self.name,
+            )
+            return
+
+        url, metadata = self._current_proxy_url, self._current_metadata
+        if not url or not metadata or not self._client:
+            return
+        content_type = "audio/mpeg" if url.lower().endswith(".mp3") else "audio/flac"
+        didl = self._build_didl(url, metadata, content_type)
+        self._delivered_keys.discard(_proxy_key(url))
+        self._starting_playback = True
+        try:
+            if await self._try_transport_sequence(url, didl) is not None:
+                logger.warning("[%s] Could not reload the current track", self.name)
+                return
+            self._playback_started_at = time.monotonic()
+            # Seek once the renderer is playing again (most refuse it before).
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                if await self._client.get_transport_info() == "PLAYING":
+                    break
+            if resume_ms > 0 and await self._client.seek(resume_ms):
+                self._last_seek_at = time.monotonic()
+        finally:
+            self._starting_playback = False
+        self._position_ms = resume_ms
+        self._furthest_position_ms = resume_ms
+        self._stall_position_ms = -1
+        self._notify_position_update(resume_ms)
+        logger.info(
+            "[%s] Current track reloaded at %s; gapless is off for this renderer",
+            self.name,
+            _format_ms(resume_ms),
+        )
+
+    def _ended_without_stop(self, pos: int) -> bool:
+        """Whether a renderer still reporting PLAYING has finished the track.
+
+        Some renderers (FiiO K17) never report STOPPED at the end of a track:
+        they stay PLAYING with the position parked at the track's length.
+        """
+        duration = self._duration_ms
+        if (
+            duration <= 0
+            or self._starting_playback
+            or self._end_handled_for == self._current_proxy_url
+            or time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS
+        ):
+            return False
+        now = time.monotonic()
+        if self._stall_position_ms < 0 or abs(pos - self._stall_position_ms) > STALL_TOLERANCE_MS:
+            self._stall_position_ms = pos
+            self._stall_since = now
+        if pos >= duration + PAST_END_MS:
+            return True
+        if pos < duration - END_WINDOW_MS:
+            return False
+        if self._next_track_proxy_url:
+            # A renderer about to move on to the armed track may hold at the
+            # end for a moment; give it the full time before stepping in.
+            needed = END_STALL_SECONDS
+        elif _proxy_key(self._current_proxy_url or "") in self._delivered_keys:
+            needed = END_STALL_DELIVERED_SECONDS
+        elif self._quirks.stops_at_end is False:
+            needed = END_STALL_KNOWN_SECONDS
+        else:
+            needed = END_STALL_SECONDS
+        return now - self._stall_since >= needed
+
+    def _handle_end_without_stop(self, pos: int) -> None:
+        """Report a track end the renderer itself never signalled."""
+        logger.info(
+            "[%s] Still PLAYING at %s of %s with the position not moving; "
+            "treating it as the end of the track",
+            self.name,
+            _format_ms(pos),
+            _format_ms(self._duration_ms),
+        )
+        self._learn("stops_at_end", False, "stayed PLAYING at the end of a track")
+        if (
+            self._next_track_proxy_url
+            and not self._is_sonos
+            and time.monotonic() - self._next_armed_at >= IGNORED_NEXT_ARMED_FOR_SECONDS
+        ):
+            self._learn(
+                "gapless",
+                False,
+                "stayed on a finished track with the next one queued",
+            )
+        self._next_track_proxy_url = None
+        self._next_track_metadata = None
+        self._end_handled_for = self._current_proxy_url
+        self._stall_position_ms = -1
+        # Mark stopped so the renderer's own stop, if it comes, is not a second end.
+        self._state = PlaybackState.STOPPED
+        self._notify_track_ended()
 
     def _next_poll_delay(self) -> float:
         """Seconds to wait before the next state poll."""

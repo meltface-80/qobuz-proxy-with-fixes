@@ -428,3 +428,22 @@ class TestRepeatOneNaturalEnd:
         await player._restart_current_track(ended_track)
 
         backend.play.assert_not_awaited()
+
+
+class TestArmingWaitsForBackend:
+    """Arming waits for the backend to say the current track is established."""
+
+    async def test_no_url_fetch_while_backend_not_ready(self):
+        player, backend = _make_player(next_track_info={"trackId": "222", "queueItemId": 9})
+        player._state = PlaybackState.PLAYING
+        backend.ready_for_next_track = False
+
+        await player._prepare_next_track_for_gapless()
+
+        player.metadata.get_streaming_url.assert_not_called()
+        backend.set_next_track.assert_not_called()
+        assert player._gapless_armed is False
+
+        backend.ready_for_next_track = True
+        await player._prepare_next_track_for_gapless()
+        backend.set_next_track.assert_awaited_once()

@@ -527,3 +527,30 @@ class TestDeviceType:
         assert _parse_yaml_speakers([d], Config())[0].device_type == "headphones"
         # The default is not written, so existing config files stay unchanged
         assert "device_type" not in speaker_config_to_dict(SpeakerConfig())
+
+
+class TestDlnaGaplessSetting:
+    """Per-speaker gapless setting: "auto" (default), "on" or "off"."""
+
+    def test_yaml_speaker_gapless_off(self) -> None:
+        from qobuz_proxy.config import Config, _parse_yaml_speakers
+
+        speakers = _parse_yaml_speakers(
+            [{"name": "Desk", "dlna_ip": "10.0.0.5", "dlna_gapless": False}], Config()
+        )
+        assert speakers[0].dlna_gapless == "off"
+
+    def test_default_is_auto_and_not_written(self) -> None:
+        from qobuz_proxy.config import Config, _parse_yaml_speakers, speaker_config_to_dict
+
+        sc = _parse_yaml_speakers([{"name": "Desk", "dlna_ip": "10.0.0.5"}], Config())[0]
+        assert sc.dlna_gapless == "auto"
+        assert "dlna_gapless" not in speaker_config_to_dict(sc)
+
+    def test_round_trip(self) -> None:
+        from qobuz_proxy.config import Config, _parse_yaml_speakers, speaker_config_to_dict
+
+        sc = _parse_yaml_speakers(
+            [{"name": "Desk", "dlna_ip": "10.0.0.5", "dlna_gapless": "off"}], Config()
+        )[0]
+        assert speaker_config_to_dict(sc)["dlna_gapless"] == "off"

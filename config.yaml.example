@@ -25,6 +25,9 @@ backend:
     fixed_volume: false         # Ignore volume commands
     proxy_port: 7120            # Audio proxy port for DLNA streaming
     # description_url: ""       # UPnP description XML URL (auto-discovered via SSDP)
+    # gapless: auto             # auto, on or off. auto: known models and what the
+                                # renderer is seen to do decide (saved per device in
+                                # dlna_quirks.json in the data directory)
   # local:
   #   device: "default"         # Audio device name or "default"
   #   buffer_size: 2048         # Audio buffer size in frames
@@ -61,6 +64,7 @@ logging:
 #     backend: dlna
 #     dlna_ip: "192.168.1.51"
 #     max_quality: 7
+#     # dlna_gapless: off        # auto (default), on or off
 #
 #   - name: "Headphones"
 #     backend: local

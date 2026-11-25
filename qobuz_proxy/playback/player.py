@@ -1663,6 +1663,11 @@ class QobuzPlayer:
         if not self.backend.supports_gapless or self._gapless_armed:
             return
 
+        # The backend may hold arming back until the device is really playing
+        # the current track; checked before fetching the next track's URL.
+        if not getattr(self.backend, "ready_for_next_track", True):
+            return
+
         if not self._get_next_track_callback:
             return
 

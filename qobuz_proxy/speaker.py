@@ -157,6 +157,12 @@ class Speaker:
             config_dict["dlna_port"] = self._config.dlna_port
             config_dict["description_url"] = self._config.dlna_description_url
             config_dict["fixed_volume"] = self._config.dlna_fixed_volume
+            config_dict["gapless"] = self._config.dlna_gapless
+            if isinstance(self._backend, DLNABackend):
+                # What the renderer is assumed or known to do, and why
+                # (profile / learned / user): shown so users can see why
+                # gapless is on or off for a speaker.
+                config_dict["renderer_behaviour"] = self._backend.quirks.describe()
         elif self._config.backend_type == "local":
             config_dict["audio_device"] = self._config.audio_device
             config_dict["buffer_size"] = self._config.audio_buffer_size
@@ -196,6 +202,7 @@ class Speaker:
                     fixed_volume=self._config.dlna_fixed_volume,
                     proxy_port=self._config.proxy_port,
                     description_url=self._config.dlna_description_url,
+                    gapless=self._config.dlna_gapless,
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,

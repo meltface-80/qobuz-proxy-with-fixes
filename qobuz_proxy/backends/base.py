@@ -146,6 +146,15 @@ class AudioBackend(ABC):
         """Whether this backend supports gapless playback. Default: False."""
         return False
 
+    @property
+    def ready_for_next_track(self) -> bool:
+        """Whether a next track may be armed right now. Default: supports_gapless.
+
+        Backends can hold arming back until the current track is established on
+        the device (some renderers mishandle a next track queued while loading).
+        """
+        return self.supports_gapless
+
     async def set_next_track(
         self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0
     ) -> bool:
