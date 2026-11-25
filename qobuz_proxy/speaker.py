@@ -8,23 +8,11 @@ run concurrently, one per physical audio device.
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from aiohttp import web
 
-from qobuz_proxy.config import (
-    AUTO_FALLBACK_QUALITY,
-    AUTO_QUALITY,
-    BackendConfig,
-    Config,
-    DeviceConfig,
-    DLNAConfig,
-    LocalConfig,
-    LoggingConfig,
-    QobuzConfig,
-    ServerConfig,
-    SpeakerConfig,
-)
+from qobuz_proxy.config import AUTO_QUALITY, Config, SpeakerConfig, speaker_component_config
 from qobuz_proxy.auth import QobuzAPIClient
 from qobuz_proxy.connect import ConnectTokens, DiscoveryService, WsManager
 from qobuz_proxy.playback import (
@@ -36,12 +24,30 @@ from qobuz_proxy.playback import (
     StateReporter,
     VolumeCommandHandler,
 )
-from qobuz_proxy.backends import AudioBackend, BackendFactory, BackendNotFoundError, PlaybackState
+from qobuz_proxy.backends import AudioBackend, BackendFactory, BackendNotFoundError
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport, wire_playing_state
 from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend, MetadataServiceURLProvider
+from qobuz_proxy.connect.ws_manager import MessageHandler
+from qobuz_proxy.speaker_quality import resolve_auto_quality
+from qobuz_proxy.speaker_status import build_speaker_status
 
 logger = logging.getLogger(__name__)
+
+
+class _AsyncMessageHandler(Protocol):
+    """A command handler whose ``handle_message`` coroutine processes one message."""
+
+    async def handle_message(self, msg_type: int, message: Any) -> None: ...
+
+
+def _spawn_on_message(handler: _AsyncMessageHandler) -> MessageHandler:
+    """Adapt ``handler.handle_message`` to a WsManager handler that runs it as a task."""
+
+    def dispatch(msg_type: int, message: Any) -> "asyncio.Task[None]":
+        return asyncio.create_task(handler.handle_message(msg_type, message))
+
+    return dispatch
 
 
 class Speaker:
@@ -124,68 +130,14 @@ class Speaker:
 
     def get_status(self) -> dict:
         """Return rich status dict for API responses."""
-        from qobuz_proxy.config import slugify_name
-
-        # Determine playback status
-        if not self._is_running:
-            playback_status = "disconnected"
-        elif self._player and self._player.state == PlaybackState.PLAYING:
-            playback_status = "playing"
-        elif self._player and self._player.state == PlaybackState.PAUSED:
-            playback_status = "paused"
-        else:
-            playback_status = "idle"
-
-        # Build now_playing if there's a current track with metadata
-        now_playing = None
-        if self._player and self._player.current_track and playback_status in ("playing", "paused"):
-            track = self._player.current_track
-            meta = track.metadata
-            now_playing = {
-                "title": meta.get("title", ""),
-                "artist": meta.get("artist", ""),
-                "album": meta.get("album", ""),
-                "album_art_url": meta.get("artwork_url", ""),
-                "quality": meta.get("quality_name", ""),
-            }
-            # With fixed volume the proxy never touches or tracks the output
-            # level, so the cached value is just the initial default — omit it.
-            if not self._config.fixed_volume:
-                now_playing["volume"] = self._player._volume
-
-        # Build config section
-        config_dict: dict = {
-            "max_quality": (
-                "auto" if self._config.max_quality == AUTO_QUALITY else self._config.max_quality
-            ),
-            "effective_quality": self._effective_quality,
-            "quality_source": self._quality_source,
-            "device_type": self._config.device_type,
-        }
-        if self._config.backend_type == "dlna":
-            config_dict["dlna_ip"] = self._config.dlna_ip
-            config_dict["dlna_port"] = self._config.dlna_port
-            config_dict["description_url"] = self._config.dlna_description_url
-            config_dict["fixed_volume"] = self._config.dlna_fixed_volume
-            config_dict["gapless"] = self._config.dlna_gapless
-            if isinstance(self._backend, DLNABackend):
-                # What the renderer is assumed or known to do, and why
-                # (profile / learned / user): shown so users can see why
-                # gapless is on or off for a speaker.
-                config_dict["renderer_behaviour"] = self._backend.quirks.describe()
-        elif self._config.backend_type == "local":
-            config_dict["audio_device"] = self._config.audio_device
-            config_dict["buffer_size"] = self._config.audio_buffer_size
-            config_dict["fixed_volume"] = self._config.audio_fixed_volume
-
-        return {
-            "id": slugify_name(self._config.name),
-            "name": self._config.name,
-            "backend": self._config.backend_type,
-            "status": playback_status,
-            "config": config_dict,
-            "now_playing": now_playing,
-        }
+        return build_speaker_status(
+            self._config,
+            is_running=self._is_running,
+            player=self._player,
+            backend=self._backend,
+            effective_quality=self._effective_quality,
+            quality_source=self._quality_source,
+        )
 
     def _build_component_config(self) -> Config:
         """
@@ -195,40 +147,7 @@ class Speaker:
         accept a Config, so we map SpeakerConfig fields into one to keep those
         components unchanged.
         """
-        cfg = Config(
-            # Qobuz config carries max_quality only; credentials are on api_client
-            qobuz=QobuzConfig(
-                max_quality=self._config.max_quality,
-            ),
-            device=DeviceConfig(
-                name=self._config.name,
-                uuid=self._config.uuid,
-                device_type=self._config.device_type,
-            ),
-            backend=BackendConfig(
-                type=self._config.backend_type,
-                dlna=DLNAConfig(
-                    ip=self._config.dlna_ip,
-                    port=self._config.dlna_port,
-                    fixed_volume=self._config.dlna_fixed_volume,
-                    proxy_port=self._config.proxy_port,
-                    description_url=self._config.dlna_description_url,
-                    gapless=self._config.dlna_gapless,
-                    udn=self._config.dlna_udn,
-                ),
-                local=LocalConfig(
-                    device=self._config.audio_device,
-                    buffer_size=self._config.audio_buffer_size,
-                    fixed_volume=self._config.audio_fixed_volume,
-                ),
-            ),
-            server=ServerConfig(
-                http_port=self._config.http_port,
-                bind_address=self._config.bind_address,
-            ),
-            logging=LoggingConfig(),
-        )
-        return cfg
+        return speaker_component_config(self._config)
 
     async def start(self) -> bool:
         """
@@ -252,42 +171,10 @@ class Speaker:
             # 3. Resolve effective quality (handle AUTO_QUALITY)
             self._effective_quality = self._config.max_quality
             if self._effective_quality == AUTO_QUALITY:
-                if isinstance(backend, DLNABackend):
-                    recommended = backend.get_recommended_quality()
-                    if recommended:
-                        self._effective_quality = recommended
-                        quality_names = {
-                            5: "MP3",
-                            6: "CD (FLAC 16/44)",
-                            7: "Hi-Res (24/96)",
-                            27: "Hi-Res (24/192)",
-                        }
-                        if backend.quality_detection_confirmed:
-                            self._quality_source = "auto"
-                            logger.info(
-                                f"[{self.name}] Auto-detected max quality: "
-                                f"{quality_names.get(self._effective_quality, self._effective_quality)}"
-                            )
-                        else:
-                            self._quality_source = "auto_fallback"
-                            logger.info(
-                                f"[{self.name}] Device did not report its supported "
-                                f"formats; using conservative quality: "
-                                f"{quality_names.get(self._effective_quality, self._effective_quality)}. "
-                                f"Set max_quality manually if the device supports hi-res."
-                            )
-                    else:
-                        self._effective_quality = AUTO_FALLBACK_QUALITY
-                        self._quality_source = "auto_fallback"
-                        logger.info(
-                            f"[{self.name}] Capability discovery unavailable, "
-                            f"using fallback quality: CD (FLAC 16/44)"
-                        )
-                else:
-                    # Local backend: default to Hi-Res 192k
-                    self._effective_quality = 27
-                    self._quality_source = "auto"
-                    logger.info(f"[{self.name}] Local backend, using max quality: Hi-Res (24/192)")
+                resolved = resolve_auto_quality(backend)
+                self._effective_quality = resolved.quality
+                self._quality_source = resolved.source
+                logger.info(f"[{self.name}] {resolved.explanation}")
 
             # 4. Create metadata service
             logger.debug(f"[{self.name}] Creating metadata service...")
@@ -381,51 +268,40 @@ class Speaker:
 
         # 1. Stop state reporter
         if self._state_reporter:
-            try:
-                await self._state_reporter.stop()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error stopping state reporter: {e}")
+            await self._shutdown_step(self._state_reporter.stop, "stopping state reporter")
 
         # 2. Stop player
         if self._player:
-            try:
-                await self._player.stop()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error stopping player: {e}")
+            await self._shutdown_step(self._player.stop, "stopping player")
 
         # 3. Disconnect WebSocket
         if self._ws_manager:
-            try:
-                await self._ws_manager.stop()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error disconnecting WebSocket: {e}")
+            await self._shutdown_step(self._ws_manager.stop, "disconnecting WebSocket")
 
         # 4. Stop discovery service
         if self._discovery:
-            try:
-                await self._discovery.stop()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error stopping discovery service: {e}")
+            await self._shutdown_step(self._discovery.stop, "stopping discovery service")
 
         # 5. Stop audio proxy
         if self._proxy_server:
-            try:
-                await self._proxy_server.stop()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error stopping proxy server: {e}")
+            await self._shutdown_step(self._proxy_server.stop, "stopping proxy server")
 
         # 6. Disconnect backend
         if self._backend:
-            try:
-                await self._backend.disconnect()
-            except Exception as e:
-                logger.warning(f"[{self.name}] Error disconnecting backend: {e}")
+            await self._shutdown_step(self._backend.disconnect, "disconnecting backend")
 
         logger.info(f"[{self.name}] Stopped")
 
     # ------------------------------------------------------------------
     # Internal callbacks and helpers
     # ------------------------------------------------------------------
+
+    async def _shutdown_step(self, step: Callable[[], Awaitable[None]], action: str) -> None:
+        """Run one teardown step, logging (not raising) any failure."""
+        try:
+            await step()
+        except Exception as e:
+            logger.warning(f"[{self.name}] Error {action}: {e}")
 
     def _get_effective_quality(self) -> int:
         """Return current effective quality (may change after auto-detection or app request)."""
@@ -506,10 +382,7 @@ class Speaker:
                 # Register all message-type handlers
                 for msg_type in self._queue_handler.get_message_types():
                     self._ws_manager.register_handler(
-                        msg_type,
-                        lambda mt, msg, h=self._queue_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
-                        ),
+                        msg_type, _spawn_on_message(self._queue_handler)
                     )
 
                 for msg_type in self._playback_handler.get_message_types():
@@ -520,10 +393,7 @@ class Speaker:
 
                 for msg_type in self._volume_handler.get_message_types():
                     self._ws_manager.register_handler(
-                        msg_type,
-                        lambda mt, msg, h=self._volume_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
-                        ),
+                        msg_type, _spawn_on_message(self._volume_handler)
                     )
 
                 # Register error handler (message type 1 = MESSAGE_TYPE_ERROR)

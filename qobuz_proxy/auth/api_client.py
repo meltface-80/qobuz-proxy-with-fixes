@@ -4,7 +4,6 @@ Qobuz API Client.
 Handles authentication, session management, and signed API requests.
 """
 
-import hashlib
 import json
 import logging
 import time
@@ -15,6 +14,7 @@ from urllib.parse import unquote, urlencode
 import aiohttp
 
 from qobuz_proxy.auth.exceptions import TransientAuthError
+from qobuz_proxy.auth.signing import sign_request
 from qobuz_proxy.auth.tokens import WSToken
 
 logger = logging.getLogger(__name__)
@@ -133,11 +133,7 @@ class QobuzAPIClient:
             params = {"profile": "qbz-1"}
 
             # Build signature: "sessionstart" + sorted key-value pairs + timestamp + secret
-            sig_string = "sessionstart"
-            for key in sorted(params.keys()):
-                sig_string += key + str(params[key])
-            sig_string += request_ts + self.app_secret
-            signature = hashlib.md5(sig_string.encode()).hexdigest()
+            signature = sign_request("sessionstart", params, request_ts, self.app_secret)
 
             url = f"{self.API_BASE}/session/start"
             body = f"profile=qbz-1&request_ts={request_ts}&request_sig={signature}"
@@ -252,19 +248,10 @@ class QobuzAPIClient:
             format_id = str(quality)
 
             # Build signature for track/getFileUrl
-            sig_string = (
-                f"trackgetFileUrlformat_id{format_id}intentstream"
-                f"track_id{track_id}{request_ts}{self.app_secret}"
-            )
-            signature = hashlib.md5(sig_string.encode()).hexdigest()
-
-            params = {
-                "format_id": format_id,
-                "intent": "stream",
-                "track_id": track_id,
-                "request_ts": request_ts,
-                "request_sig": signature,
-            }
+            params = {"format_id": format_id, "intent": "stream", "track_id": track_id}
+            signature = sign_request("trackgetFileUrl", params, request_ts, self.app_secret)
+            params["request_ts"] = request_ts
+            params["request_sig"] = signature
 
             url = f"{self.API_BASE}/track/getFileUrl?{urlencode(params)}"
             headers: dict[str, str] = {
@@ -458,11 +445,7 @@ class QobuzAPIClient:
         request_ts = f"{time.time():.6f}"
 
         # Build signature
-        sig_string = obj + action
-        for key in sorted(params.keys()):
-            sig_string += key + str(params[key])
-        sig_string += request_ts + self.app_secret
-        signature = hashlib.md5(sig_string.encode()).hexdigest()
+        signature = sign_request(obj + action, params, request_ts, self.app_secret)
 
         params["request_ts"] = request_ts
         params["request_sig"] = signature
