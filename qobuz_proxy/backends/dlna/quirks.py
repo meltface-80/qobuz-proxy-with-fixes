@@ -28,8 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 from qobuz_proxy.config import (  # noqa: F401 (re-exported)
     GAPLESS_AUTO,
     GAPLESS_MODES,
@@ -37,6 +35,8 @@ from qobuz_proxy.config import (  # noqa: F401 (re-exported)
     GAPLESS_ON,
     parse_gapless_mode,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
