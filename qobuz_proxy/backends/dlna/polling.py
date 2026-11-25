@@ -14,6 +14,7 @@ from typing import Optional
 
 from qobuz_proxy.backends.types import PlaybackState
 
+from .events import EventSubscription
 from .timing import (
     NEAR_END_POLL_INTERVAL_SECONDS,
     NEAR_END_WINDOW_MS,
@@ -55,6 +56,35 @@ class PollingMixin(TrackEndMixin):
             return None
         # Unknown vendor states (e.g. "RECORDING") read as stopped, as before.
         return _TRANSPORT_STATES.get(state_str.strip().upper(), PlaybackState.STOPPED)
+
+    # =========================================================================
+    # UPnP events (wake-ups only)
+    # =========================================================================
+
+    def _schedule_events(self) -> None:
+        """Subscribe to renderer events once both the renderer and the proxy are up."""
+        if self._is_connected and self._proxy_server is not None and self._events_task is None:
+            self._events_task = asyncio.create_task(self._start_events())
+
+    async def _start_events(self) -> None:
+        """Subscribe to AVTransport events, delivered to the audio proxy."""
+        info = self.device_info
+        proxy = self._proxy_server
+        if self._events or not info or not info.av_transport_event_url or proxy is None:
+            return
+        callback_url = proxy.register_event_handler(self._event_token, self._on_notify)
+        self._events = EventSubscription(
+            info.av_transport_event_url, callback_url, self._on_event, name=self.name
+        )
+        self._events_active = await self._events.start()
+
+    def _on_notify(self, sid: str, body: str) -> bool:
+        return self._events is not None and self._events.handle_notify(sid, body)
+
+    def _on_event(self, values: dict[str, str]) -> None:
+        if "TransportState" in values or "CurrentTrackURI" in values:
+            logger.debug(f"[{self.name}] Event: {values.get('TransportState', '')}")
+            self.wake_poll()
 
     def wake_poll(self) -> None:
         """Poll now instead of at the next interval (a UPnP event arrived)."""

@@ -3,7 +3,7 @@ DLNA audio backend.
 
 Implements the AudioBackend interface for DLNA/UPnP renderers. The class is
 assembled from layers (see ``backend_base.py``); this module adds connecting,
-transport commands, volume and capability reporting.
+transport commands and volume.
 """
 
 import asyncio
@@ -18,13 +18,10 @@ from qobuz_proxy.backends.types import (
     PlaybackState,
 )
 
-from .capabilities import CapabilityCache, DLNACapabilities, apply_device_overrides
-from .capabilities import parse_protocol_info_sink
 from .client import DLNAClient, DLNAClientError, DLNAUnsupportedDeviceError
 from .description import DLNADeviceInfo
 from .didl import content_type_for, format_ms, proxy_key, source_label
 from .discovery import DLNADiscovery
-from .events import EventSubscription
 from .polling import PollingMixin
 from .timing import (  # noqa: F401 (re-exported for callers and tests)
     ARM_AFTER_PLAYING_SECONDS,
@@ -51,9 +48,6 @@ _format_ms = format_ms
 
 # How long a search for a renderer that moved (new IP) may take.
 RELOCATE_TIMEOUT_SECONDS = 3.0
-
-# Class-level capability cache (shared across instances)
-_capability_cache = CapabilityCache()
 
 
 class DLNABackend(PollingMixin):
@@ -155,56 +149,6 @@ class DLNABackend(PollingMixin):
         if old_client is not None:
             await old_client.disconnect()
         return True
-
-    def _schedule_events(self) -> None:
-        """Subscribe to renderer events once both the renderer and the proxy are up."""
-        if self._is_connected and self._proxy_server is not None and self._events_task is None:
-            self._events_task = asyncio.create_task(self._start_events())
-
-    async def _start_events(self) -> None:
-        """Subscribe to AVTransport events, delivered to the audio proxy."""
-        info = self.device_info
-        proxy = self._proxy_server
-        if self._events or not info or not info.av_transport_event_url or proxy is None:
-            return
-        callback_url = proxy.register_event_handler(self._event_token, self._on_notify)
-        self._events = EventSubscription(
-            info.av_transport_event_url, callback_url, self._on_event, name=self.name
-        )
-        self._events_active = await self._events.start()
-
-    def _on_notify(self, sid: str, body: str) -> bool:
-        return self._events is not None and self._events.handle_notify(sid, body)
-
-    def _on_event(self, values: dict[str, str]) -> None:
-        if "TransportState" in values or "CurrentTrackURI" in values:
-            logger.debug(f"[{self.name}] Event: {values.get('TransportState', '')}")
-            self.wake_poll()
-
-    async def _discover_capabilities(self, device_info: DLNADeviceInfo) -> None:
-        """Query and parse device capabilities."""
-        device_id = device_info.udn or self._ip
-        cached = _capability_cache.get(device_id)
-        if cached:
-            logger.debug(f"Using cached capabilities for {device_id}")
-            self._capabilities = cached
-            return
-        try:
-            if not self._client:
-                return
-            sink = await self._client.get_protocol_info()
-            if sink:
-                self._capabilities = parse_protocol_info_sink(sink)
-                apply_device_overrides(
-                    self._capabilities, device_info.manufacturer, device_info.model_name
-                )
-                _capability_cache.set(device_id, self._capabilities)
-            else:
-                logger.debug("GetProtocolInfo not supported, using defaults")
-                self._capabilities = None
-        except Exception as e:
-            logger.warning(f"Failed to discover capabilities: {e}")
-            self._capabilities = None
 
     async def disconnect(self) -> None:
         """Disconnect from DLNA device."""
@@ -496,33 +440,3 @@ class DLNABackend(PollingMixin):
             backend_info.model = info.model_name
             backend_info.manufacturer = info.manufacturer
         return backend_info
-
-    def get_capabilities(self) -> Optional[DLNACapabilities]:
-        """Discovered device capabilities, if any."""
-        return self._capabilities
-
-    def get_recommended_quality(self) -> Optional[int]:
-        """Recommended Qobuz quality (5, 6, 7 or 27), or None if unknown.
-
-        What the renderer states about its formats wins; a model profile
-        fills in for renderers that list FLAC without sample rates.
-        """
-        caps = self._capabilities
-        if caps is not None and caps.format_info_confirmed:
-            return caps.max_quality
-        profile_quality = self._quirks.max_quality
-        if profile_quality and (caps is None or caps.supports_flac):
-            return profile_quality
-        return caps.max_quality if caps is not None else None
-
-    @property
-    def quality_detection_confirmed(self) -> bool:
-        """Whether the recommended quality came from device format info or a model profile.
-
-        False means the device advertised FLAC without stating sample rates or
-        bit depths, so the recommendation is just a conservative CD default.
-        """
-        caps = self._capabilities
-        if caps is not None and caps.format_info_confirmed:
-            return True
-        return bool(self._quirks.max_quality) and (caps is None or caps.supports_flac)

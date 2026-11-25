@@ -304,17 +304,16 @@ class DiscoveryService:
         # Register on the same interface we advertise. Joining every Docker
         # bridge can exhaust Linux's multicast membership limit before the LAN
         # interface is reached, leaving the speaker intermittently undiscoverable.
-        self._zeroconf = Zeroconf(interfaces=[local_ip])
-        loop = asyncio.get_event_loop()
+        zeroconf = self._zeroconf = Zeroconf(interfaces=[local_ip])
+        service_info = self._service_info
+        loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, self._zeroconf.register_service, self._service_info)
+            await loop.run_in_executor(None, zeroconf.register_service, service_info)
         except Exception:
             # Name may conflict with a stale entry from a previous run — re-register as owner
             await loop.run_in_executor(
                 None,
-                lambda: self._zeroconf.register_service(
-                    self._service_info, cooperating_responders=True
-                ),
+                lambda: zeroconf.register_service(service_info, cooperating_responders=True),
             )
 
         logger.info(
@@ -325,7 +324,7 @@ class DiscoveryService:
     async def _unregister_mdns(self) -> None:
         """Unregister mDNS service."""
         if self._zeroconf and self._service_info:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._zeroconf.unregister_service, self._service_info)
             await loop.run_in_executor(None, self._zeroconf.close)
             logger.debug("Unregistered mDNS service")

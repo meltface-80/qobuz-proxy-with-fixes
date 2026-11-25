@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.backends.types import BackendTrackMetadata
 
-from .capabilities import DLNACapabilities, build_protocol_info
+from .capabilities import (
+    CapabilityCache,
+    DLNACapabilities,
+    apply_device_overrides,
+    build_protocol_info,
+    parse_protocol_info_sink,
+)
 from .client import DLNAClient
 from .description import DLNADeviceInfo
 from .didl import build_didl, proxy_key
@@ -39,6 +45,9 @@ if TYPE_CHECKING:
     from .proxy_server import AudioProxyServer
 
 logger = logging.getLogger(__name__)
+
+# Class-level capability cache (shared across instances)
+_capability_cache = CapabilityCache()
 
 
 class DLNABackendBase(AudioBackend):
@@ -235,6 +244,65 @@ class DLNABackendBase(AudioBackend):
             self._gapless_supported = True
             self._apply_quirks(info)
         return forgotten
+
+    # =========================================================================
+    # Capabilities and recommended quality
+    # =========================================================================
+
+    async def _discover_capabilities(self, device_info: DLNADeviceInfo) -> None:
+        """Query and parse device capabilities."""
+        device_id = device_info.udn or self._ip
+        cached = _capability_cache.get(device_id)
+        if cached:
+            logger.debug(f"Using cached capabilities for {device_id}")
+            self._capabilities = cached
+            return
+        try:
+            if not self._client:
+                return
+            sink = await self._client.get_protocol_info()
+            if sink:
+                self._capabilities = parse_protocol_info_sink(sink)
+                apply_device_overrides(
+                    self._capabilities, device_info.manufacturer, device_info.model_name
+                )
+                _capability_cache.set(device_id, self._capabilities)
+            else:
+                logger.debug("GetProtocolInfo not supported, using defaults")
+                self._capabilities = None
+        except Exception as e:
+            logger.warning(f"Failed to discover capabilities: {e}")
+            self._capabilities = None
+
+    def get_capabilities(self) -> Optional[DLNACapabilities]:
+        """Discovered device capabilities, if any."""
+        return self._capabilities
+
+    def get_recommended_quality(self) -> Optional[int]:
+        """Recommended Qobuz quality (5, 6, 7 or 27), or None if unknown.
+
+        What the renderer states about its formats wins; a model profile
+        fills in for renderers that list FLAC without sample rates.
+        """
+        caps = self._capabilities
+        if caps is not None and caps.format_info_confirmed:
+            return caps.max_quality
+        profile_quality = self._quirks.max_quality
+        if profile_quality and (caps is None or caps.supports_flac):
+            return profile_quality
+        return caps.max_quality if caps is not None else None
+
+    @property
+    def quality_detection_confirmed(self) -> bool:
+        """Whether the recommended quality came from device format info or a model profile.
+
+        False means the device advertised FLAC without stating sample rates or
+        bit depths, so the recommendation is just a conservative CD default.
+        """
+        caps = self._capabilities
+        if caps is not None and caps.format_info_confirmed:
+            return True
+        return bool(self._quirks.max_quality) and (caps is None or caps.supports_flac)
 
     # =========================================================================
     # Per-track state
