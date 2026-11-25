@@ -7,107 +7,34 @@ Handles track ordering, shuffle, repeat, and preloading.
 import asyncio
 import logging
 import random
-import time
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Optional
+
+from .queue_preload import QueuePreloadMixin
+from .queue_types import (
+    URL_CACHE_TTL_SECONDS,
+    MetadataCallback,
+    QueueState,
+    QueueTrack,
+    QueueVersion,
+    RepeatMode,
+    UrlCallback,
+)
+
+__all__ = [
+    "URL_CACHE_TTL_SECONDS",
+    "MetadataCallback",
+    "QobuzQueue",
+    "QueueState",
+    "QueueTrack",
+    "QueueVersion",
+    "RepeatMode",
+    "UrlCallback",
+]
 
 logger = logging.getLogger(__name__)
 
-# How long a cached streaming URL may be trusted. Qobuz signed URLs live for
-# ~5 minutes; anything older than this must be re-fetched before use.
-URL_CACHE_TTL_SECONDS = 240.0
 
-
-class RepeatMode(Enum):
-    """Queue repeat modes."""
-
-    OFF = "off"  # Stop after last track
-    ONE = "one"  # Repeat current track
-    ALL = "all"  # Loop entire queue
-
-
-@dataclass
-class QueueTrack:
-    """
-    Represents a track in the queue.
-
-    Attributes:
-        queue_item_id: Unique ID for this queue entry (from server)
-        track_id: Qobuz track ID (for API calls)
-        context_uuid: Optional context (album, playlist) UUID
-        streaming_url: Cached streaming URL (may expire)
-        metadata: Cached track metadata dict
-        start_ms: Start position for partial plays
-        duration_ms: Track duration in milliseconds
-    """
-
-    queue_item_id: int
-    track_id: str
-    context_uuid: Optional[bytes] = None
-    streaming_url: Optional[str] = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    start_ms: int = 0
-    duration_ms: int = 0
-    url_fetched_at: float = 0.0  # time.time() when streaming_url was cached
-
-    def set_streaming_url(self, url: Optional[str]) -> None:
-        """Cache a streaming URL together with its fetch time."""
-        self.streaming_url = url
-        self.url_fetched_at = time.time() if url else 0.0
-
-    def url_is_stale(self, ttl_s: float = URL_CACHE_TTL_SECONDS) -> bool:
-        """Whether the cached URL must be treated as absent (missing or past TTL)."""
-        if not self.streaming_url:
-            return True
-        return (time.time() - self.url_fetched_at) >= ttl_s
-
-
-@dataclass
-class QueueVersion:
-    """
-    Queue version for synchronization.
-
-    The server tracks queue state with major/minor version numbers.
-    Major increments on structural changes (add/remove/reorder).
-    Minor increments on metadata updates.
-    """
-
-    major: int = 0
-    minor: int = 0
-
-    def __str__(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-    def is_newer_than(self, other: "QueueVersion") -> bool:
-        """Check if this version is newer than another."""
-        if self.major != other.major:
-            return self.major > other.major
-        return self.minor > other.minor
-
-
-@dataclass
-class QueueState:
-    """
-    Snapshot of current queue state for reporting.
-
-    Used when sending state updates to the Qobuz app.
-    """
-
-    version: QueueVersion
-    track_count: int
-    current_index: int
-    current_queue_item_id: int
-    shuffle_enabled: bool
-    repeat_mode: RepeatMode
-
-
-# Type alias for callbacks
-UrlCallback = Callable[[str], Coroutine[Any, Any, Optional[str]]]
-MetadataCallback = Callable[[str], Coroutine[Any, Any, Optional[dict[str, Any]]]]
-
-
-class QobuzQueue:
+class QobuzQueue(QueuePreloadMixin):
     """
     Queue manager for QobuzProxy.
 
@@ -118,9 +45,6 @@ class QobuzQueue:
     - Preloading upcoming tracks
     - Version synchronization with server
     """
-
-    # Number of tracks to preload ahead
-    PRELOAD_COUNT = 3
 
     def __init__(self) -> None:
         """Initialize empty queue."""
@@ -154,43 +78,6 @@ class QobuzQueue:
         self._is_running = False
 
         logger.debug("QobuzQueue initialized")
-
-    # =========================================================================
-    # Callback Registration
-    # =========================================================================
-
-    def set_url_callback(self, callback: UrlCallback) -> None:
-        """Set callback for fetching streaming URLs."""
-        self._get_url_callback = callback
-
-    def set_metadata_callback(self, callback: MetadataCallback) -> None:
-        """Set callback for fetching track metadata."""
-        self._get_metadata_callback = callback
-
-    # =========================================================================
-    # Lifecycle
-    # =========================================================================
-
-    async def start(self) -> None:
-        """Start queue preloading background task."""
-        if self._is_running:
-            return
-
-        self._is_running = True
-        self._preload_task = asyncio.create_task(self._preload_loop())
-        logger.info("Queue preloading started")
-
-    async def stop(self) -> None:
-        """Stop queue preloading."""
-        self._is_running = False
-        if self._preload_task:
-            self._preload_task.cancel()
-            try:
-                await self._preload_task
-            except asyncio.CancelledError:
-                pass
-            self._preload_task = None
-        logger.info("Queue preloading stopped")
 
     # =========================================================================
     # Queue Management
@@ -471,90 +358,6 @@ class QobuzQueue:
             if track:
                 logger.debug(f"Went back to track {track.track_id} at index {self._current_index}")
             return track
-
-    # =========================================================================
-    # Preloading
-    # =========================================================================
-
-    async def _preload_loop(self) -> None:
-        """Background task to preload upcoming tracks."""
-        while self._is_running:
-            try:
-                await self._preload_upcoming()
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Preload error: {e}", exc_info=True)
-                await asyncio.sleep(5.0)
-
-    async def _preload_upcoming(self) -> None:
-        """Preload metadata and URLs for upcoming tracks."""
-        tracks_to_preload: list[QueueTrack] = []
-
-        async with self._lock:
-            for i in range(self.PRELOAD_COUNT):
-                idx = self._current_index + i
-                if idx >= len(self._shuffled_indexes):
-                    break
-
-                track_index = self._shuffled_indexes[idx]
-                track = self._tracks[track_index]
-
-                # Skip if already preloaded — unless its cached URL went stale,
-                # in which case it needs a fresh one before it can be played
-                if track.queue_item_id in self._preloaded_ids and not track.url_is_stale():
-                    continue
-
-                tracks_to_preload.append(track)
-
-        # Preload outside lock
-        for track in tracks_to_preload:
-            try:
-                # Fetch metadata if missing
-                if not track.metadata and self._get_metadata_callback:
-                    metadata = await self._get_metadata_callback(track.track_id)
-                    if metadata:
-                        track.metadata = metadata
-                        track.duration_ms = metadata.get("duration_ms", 0)
-                        logger.debug(
-                            f"Preloaded metadata for track {track.track_id}: "
-                            f"{metadata.get('artist', '?')} - {metadata.get('title', '?')}"
-                        )
-
-                # Fetch URL if missing or stale
-                if track.url_is_stale() and self._get_url_callback:
-                    url = await self._get_url_callback(track.track_id)
-                    if url:
-                        track.set_streaming_url(url)
-                        logger.debug(f"Preloaded URL for track {track.track_id}")
-
-                # Mark as preloaded
-                async with self._lock:
-                    self._preloaded_ids.add(track.queue_item_id)
-
-            except Exception as e:
-                logger.warning(f"Failed to preload track {track.track_id}: {e}")
-
-    def _invalidate_stale_preloads(self) -> None:
-        """Remove preloaded tracks that are no longer upcoming (must hold lock)."""
-        if not self._preloaded_ids:
-            return
-
-        # Get expected upcoming queue_item_ids
-        expected_ids: set[int] = set()
-        for i in range(self.PRELOAD_COUNT + 1):  # +1 to include current
-            idx = self._current_index + i
-            if idx >= len(self._shuffled_indexes):
-                break
-            track_index = self._shuffled_indexes[idx]
-            expected_ids.add(self._tracks[track_index].queue_item_id)
-
-        # Keep only expected
-        stale = self._preloaded_ids - expected_ids
-        if stale:
-            self._preloaded_ids -= stale
-            logger.debug(f"Invalidated {len(stale)} stale preloaded tracks")
 
     # =========================================================================
     # State Access

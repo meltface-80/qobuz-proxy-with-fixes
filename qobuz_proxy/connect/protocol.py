@@ -6,97 +6,40 @@ Handles the custom frame format used by Qobuz Connect WebSocket protocol.
 
 import logging
 import time
-from dataclasses import dataclass
-from enum import IntEnum
-from typing import Optional, Tuple
+from typing import Optional
 
-from qobuz_proxy.proto import envelope as envelope_pb2
-from qobuz_proxy.proto import payload as payload_pb2
-from qobuz_proxy.proto import common as common_pb2
+from .framing import decode_varint, pack_frame
+from .pb import QConnectBatch, QConnectMessage, RendererState, common_pb2, envelope_pb2, payload_pb2
+from .protocol_types import (
+    PROTOCOL_TO_QUALITY,
+    QUALITY_AUDIO_PROPERTIES,
+    QUALITY_TO_PROTOCOL,
+    DecodedMessage,
+    JoinSessionReason,
+    MessageType,
+    QConnectMessageType,
+    QConnectProto,
+)
+
+__all__ = [
+    "INT32_MAX",
+    "INT32_MIN",
+    "PROTOCOL_TO_QUALITY",
+    "QUALITY_AUDIO_PROPERTIES",
+    "QUALITY_TO_PROTOCOL",
+    "DecodedMessage",
+    "JoinSessionReason",
+    "MessageType",
+    "ProtocolCodec",
+    "QConnectMessageType",
+    "QConnectProto",
+]
 
 logger = logging.getLogger(__name__)
 
 
 INT32_MIN = -(2**31)
 INT32_MAX = 2**31 - 1
-
-
-class MessageType(IntEnum):
-    """Outer envelope message types."""
-
-    AUTHENTICATE = 1
-    SUBSCRIBE = 2
-    UNSUBSCRIBE = 3
-    PAYLOAD = 6
-    ERROR = 9
-    DISCONNECT = 10
-
-
-class QConnectProto(IntEnum):
-    """Protocol identifiers."""
-
-    QP_QCONNECT = 1
-
-
-class QConnectMessageType(IntEnum):
-    """Inner QConnect message types (subset of commonly used)."""
-
-    # Renderer -> Server
-    RNDR_SRVR_JOIN_SESSION = 21
-    RNDR_SRVR_DEVICE_INFO_UPDATED = 22
-    RNDR_SRVR_STATE_UPDATED = 23
-    RNDR_SRVR_RENDERER_ACTION = 24
-    RNDR_SRVR_VOLUME_CHANGED = 25
-    RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED = 26
-    RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED = 27
-    RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED = 28
-
-    # Server -> Renderer commands
-    SRVR_RNDR_SET_STATE = 41
-    SRVR_RNDR_SET_VOLUME = 42
-    SRVR_RNDR_SET_ACTIVE = 43
-    SRVR_RNDR_SET_MAX_AUDIO_QUALITY = 44
-    SRVR_RNDR_SET_LOOP_MODE = 45
-    SRVR_RNDR_SET_SHUFFLE_MODE = 46
-    SRVR_RNDR_SET_AUTOPLAY_MODE = 47
-
-    # Server -> Controller
-    SRVR_CTRL_QUEUE_STATE = 90
-    SRVR_CTRL_QUEUE_TRACKS_LOADED = 91
-
-
-class JoinSessionReason(IntEnum):
-    """Join reasons used by the Qobuz client (web bundle 8.2.0-b034)."""
-
-    CONTROLLER_REQUEST = 1
-    RECONNECTION = 2
-
-
-@dataclass
-class DecodedMessage:
-    """Decoded WebSocket message."""
-
-    msg_type: MessageType
-    msg_id: int = 0
-    msg_date: int = 0
-    payload: Optional[bytes] = None
-    error_code: int = 0
-    error_message: str = ""
-
-
-# Quality ID to protocol value mapping
-# Qobuz quality IDs: 5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k
-# Protocol values: 1=MP3, 2=LOSSLESS, 3=HIRES_L1, 4=HIRES_L3
-QUALITY_TO_PROTOCOL = {5: 1, 6: 2, 7: 3, 27: 4}
-PROTOCOL_TO_QUALITY = {1: 5, 2: 6, 3: 7, 4: 27}
-
-# Default audio properties for each quality level: (sample_rate_hz, bit_depth, nb_channels)
-QUALITY_AUDIO_PROPERTIES = {
-    5: (44100, 16, 2),  # MP3 320kbps
-    6: (44100, 16, 2),  # CD quality FLAC
-    7: (96000, 24, 2),  # Hi-Res 96kHz
-    27: (192000, 24, 2),  # Hi-Res 192kHz
-}
 
 
 class ProtocolCodec:
@@ -154,7 +97,7 @@ class ProtocolCodec:
         msg.msgDate = self._now_ms()
         msg.jwt = jwt
 
-        return self._pack_frame(MessageType.AUTHENTICATE, msg.SerializeToString())
+        return pack_frame(MessageType.AUTHENTICATE, msg.SerializeToString())
 
     def encode_subscribe(self, session_uuid: bytes) -> bytes:
         """
@@ -172,7 +115,7 @@ class ProtocolCodec:
         msg.proto = QConnectProto.QP_QCONNECT
         msg.channels.append(session_uuid)
 
-        return self._pack_frame(MessageType.SUBSCRIBE, msg.SerializeToString())
+        return pack_frame(MessageType.SUBSCRIBE, msg.SerializeToString())
 
     def encode_payload(
         self,
@@ -198,7 +141,7 @@ class ProtocolCodec:
             msg.dests.extend(dest_channels)
         msg.payload = inner_payload
 
-        return self._pack_frame(MessageType.PAYLOAD, msg.SerializeToString())
+        return pack_frame(MessageType.PAYLOAD, msg.SerializeToString())
 
     def encode_state_update(
         self,
@@ -258,20 +201,14 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_STATE_UPDATED
         qc_msg.rndrSrvrStateUpdated.CopyFrom(state_updated)
 
-        # Wrap in QConnectBatch
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(qc_msg)
 
     def encode_join_session(
         self,
         device_uuid: bytes,
         friendly_name: str,
         session_uuid: bytes,
-        initial_state: Optional[common_pb2.RendererState] = None,
+        initial_state: Optional[RendererState] = None,
         max_audio_quality: int = 27,
         *,
         supports_volume_control: bool = True,
@@ -328,13 +265,7 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_JOIN_SESSION
         qc_msg.rndrSrvrJoinSession.CopyFrom(join)
 
-        # Wrap in QConnectBatch
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(qc_msg)
 
     def encode_volume_changed(self, volume: int) -> bytes:
         """
@@ -353,23 +284,14 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_VOLUME_CHANGED
         qc_msg.rndrSrvrVolumeChanged.CopyFrom(vol_msg)
 
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(qc_msg)
 
     def encode_next_track(self) -> bytes:
         """Request the server's next queue item using renderer action NEXT=2."""
         message = payload_pb2.QConnectMessage()
         message.messageType = QConnectMessageType.RNDR_SRVR_RENDERER_ACTION
         message.rndrSrvrRendererAction.action = 2
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(message)
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(message)
 
     def encode_file_audio_quality_changed(
         self,
@@ -408,12 +330,7 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED
         qc_msg.rndrSrvrFileAudioQualityChanged.CopyFrom(quality_msg)
 
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(qc_msg)
 
     def encode_device_audio_quality_changed(
         self,
@@ -450,12 +367,7 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED
         qc_msg.rndrSrvrDeviceAudioQualityChanged.CopyFrom(quality_msg)
 
-        batch = payload_pb2.QConnectBatch()
-        batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
-        return self.encode_payload(batch.SerializeToString())
+        return self._encode_batch(qc_msg)
 
     def encode_max_audio_quality_changed(self, quality: int, network_type: int = 1) -> bytes:
         """
@@ -484,31 +396,15 @@ class ProtocolCodec:
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED
         qc_msg.rndrSrvrMaxAudioQualityChanged.CopyFrom(quality_msg)
 
+        return self._encode_batch(qc_msg)
+
+    def _encode_batch(self, message: QConnectMessage) -> bytes:
+        """Wrap one QConnectMessage in a QConnectBatch and encode it as a PAYLOAD frame."""
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
         batch.messagesId = self._next_batch_id()
-        batch.messages.append(qc_msg)
-
+        batch.messages.append(message)
         return self.encode_payload(batch.SerializeToString())
-
-    def _pack_frame(self, msg_type: MessageType, data: bytes) -> bytes:
-        """
-        Pack data into wire frame format.
-
-        Format: [type: 1 byte][length: varint][data: N bytes]
-        """
-        frame = bytearray()
-        frame.append(msg_type)
-
-        # Encode length as varint
-        length = len(data)
-        while length > 0x7F:
-            frame.append((length & 0x7F) | 0x80)
-            length >>= 7
-        frame.append(length & 0x7F)
-
-        frame.extend(data)
-        return bytes(frame)
 
     # -------------------------------------------------------------------------
     # Decoding
@@ -534,34 +430,13 @@ class ProtocolCodec:
             return None
 
         # Decode varint length
-        length, offset = self._decode_varint(data, 1)
+        length, offset = decode_varint(data, 1)
         if offset < 0:
             return None
 
         payload = data[offset : offset + length]
 
         return self._decode_by_type(msg_type, payload)
-
-    def _decode_varint(self, data: bytes, start: int) -> Tuple[int, int]:
-        """
-        Decode varint starting at position.
-
-        Returns:
-            (value, next_offset) or (-1, -1) on error
-        """
-        value = 0
-        shift = 0
-        offset = start
-
-        while offset < len(data):
-            byte = data[offset]
-            value |= (byte & 0x7F) << shift
-            offset += 1
-            if not (byte & 0x80):
-                return value, offset
-            shift += 7
-
-        return -1, -1
 
     def _decode_by_type(self, msg_type: MessageType, payload: bytes) -> DecodedMessage:
         """Decode payload based on message type."""
@@ -592,7 +467,7 @@ class ProtocolCodec:
 
         return result
 
-    def decode_qconnect_batch(self, payload: bytes) -> Optional[payload_pb2.QConnectBatch]:
+    def decode_qconnect_batch(self, payload: bytes) -> Optional[QConnectBatch]:
         """
         Decode inner QConnectBatch from PAYLOAD message.
 
