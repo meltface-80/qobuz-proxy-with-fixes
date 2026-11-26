@@ -10,6 +10,8 @@ import pytest
 from qobuz_proxy.backends.dlna import backend as backend_mod
 from qobuz_proxy.backends.dlna.backend import (
     ARM_AFTER_PLAYING_SECONDS,
+    ARM_AFTER_POSITION_MS,
+    END_STALL_AT_END_SECONDS,
     END_STALL_DELIVERED_SECONDS,
     END_STALL_KNOWN_SECONDS,
     END_STALL_SECONDS,
@@ -148,7 +150,9 @@ async def test_no_arming_until_renderer_heard_playing(store, clock):
     assert await b.set_next_track(NEXT, meta, 2) is False
     b._client.set_next_av_transport_uri.assert_not_called()
 
-    b._note_playing(3_000)
+    b._note_playing(ARM_AFTER_POSITION_MS - 1_000)
+    assert b.ready_for_next_track is False
+    b._note_playing(ARM_AFTER_POSITION_MS)
     assert b.ready_for_next_track is True
     assert await b.set_next_track(NEXT, meta, 2) is True
     b._client.set_next_av_transport_uri.assert_called_once()
@@ -173,30 +177,35 @@ async def test_poll_confirms_playing(store, clock, monkeypatch):
 # --------------------------------------------------------------- end without STOPPED
 
 
-def parked(b, clock, seconds):
-    """Report a stalled position at the track's end for ``seconds``."""
-    assert not b._ended_without_stop(200_000)
+def parked(b, clock, seconds, pos=200_000):
+    """Report a stalled position (default: at the track's end) for ``seconds``."""
+    assert not b._ended_without_stop(pos)
     clock.now += seconds
-    return b._ended_without_stop(200_000)
+    return b._ended_without_stop(pos)
 
 
 @pytest.mark.parametrize(
-    "delivered, known, needed",
+    "pos, delivered, known, needed",
     [
-        (True, False, END_STALL_DELIVERED_SECONDS),
-        (False, True, END_STALL_KNOWN_SECONDS),
-        (False, False, END_STALL_SECONDS),
+        # Parked at the length (where the K17 parks): short wait with evidence.
+        (200_000, True, False, END_STALL_AT_END_SECONDS),
+        (200_000, False, True, END_STALL_AT_END_SECONDS),
+        (200_000, False, False, END_STALL_SECONDS),
+        # Parked just short of it (Qobuz's length can differ by a second).
+        (199_000, True, False, END_STALL_DELIVERED_SECONDS),
+        (199_000, False, True, END_STALL_KNOWN_SECONDS),
+        (199_000, False, False, END_STALL_SECONDS),
     ],
 )
-def test_end_stall_thresholds(store, clock, delivered, known, needed):
+def test_end_stall_thresholds(store, clock, pos, delivered, known, needed):
     b = make_backend(store, clock)
     if delivered:
         b._on_delivery_complete("123")
     if known:
         b._quirks.stops_at_end = False
-    assert not parked(b, clock, needed - 0.5)
+    assert not parked(b, clock, needed - 0.5, pos)
     clock.now += 0.5
-    assert b._ended_without_stop(200_000)
+    assert b._ended_without_stop(pos)
 
 
 def test_moving_position_near_end_is_not_a_stall(store, clock):
@@ -276,7 +285,10 @@ async def test_early_switch_right_after_arming(store, clock, monkeypatch):
     b._client.get_position_info.return_value = 0
     await poll(b, monkeypatch, times=3)
     assert store.get(UDN)["gapless"] is False
-    b._client.seek.assert_called_once_with(4_000)
+    # Little to lose this early: the track restarts rather than seek on a
+    # renderer that just misbehaved (a K17 crashed after reload + Seek).
+    b._client.set_av_transport_uri.assert_called_once()
+    b._client.seek.assert_not_called()
 
 
 async def test_armed_next_waits_full_stall_time(store, clock):
@@ -342,3 +354,63 @@ def test_dlna_headers_only_when_asked():
     assert headers["contentFeatures.dlna.org"].startswith("DLNA.ORG_OP=01")
     assert headers["transferMode.dlna.org"] == "Streaming"
     assert _dlna_headers(SimpleNamespace(headers={})) == {}  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------- real FiiO K17
+# From hand-sent SOAP and a live run against a real K17: it describes itself
+# as stock gmediarender, replaces the playing track as soon as a next one is
+# queued, and keeps a queued URI through Stop until an empty
+# SetNextAVTransportURI clears it.
+
+K17 = {
+    "manufacturer": "Ivo Clarysse, Henner Zeller",
+    "model": "FIIO K17",
+    "friendly_name": "FIIO K17",
+    "udn": "uuid:FiiORender-1234",
+}
+
+
+def test_k17_profile_matches_the_real_description():
+    p = profile_for(K17["manufacturer"], K17["model"], K17["friendly_name"], K17["udn"])
+    assert p is not None and p.id == "fiio-k17"
+    # A plain gmediarender, or another brand's "K17", is not a FiiO K17.
+    assert profile_for(K17["manufacturer"], "gmediarender", "Living Room", "uuid:a") is None
+    assert profile_for("Acme", "K17", "K17", "uuid:a") is None
+
+
+async def test_real_k17_never_receives_set_next(store, clock):
+    b = make_backend(store, clock, manufacturer=K17["manufacturer"], model=K17["model"])
+    assert b.supports_gapless is False
+    b._playing_confirmed = True
+    meta = BackendTrackMetadata(track_id="456", title="N", artist="A", album="B", duration_ms=1)
+    assert await b.set_next_track(NEXT, meta, 2) is False
+    b._client.set_next_av_transport_uri.assert_not_called()
+
+
+async def test_early_switch_clears_the_queued_uri_first(store, clock, monkeypatch):
+    b = make_backend(store, clock)
+    b._next_track_proxy_url = NEXT
+    b._furthest_position_ms = 60_000
+    b._client.get_position_info.return_value = 1_000
+    await poll(b, monkeypatch)
+    b._client.set_next_av_transport_uri.assert_awaited_with("", "")
+
+
+async def test_clearing_the_next_track_clears_it_on_the_renderer(store, clock):
+    b = make_backend(store, clock)
+    b._next_track_proxy_url = NEXT
+    await b.clear_next_track()
+    b._client.set_next_av_transport_uri.assert_awaited_once_with("", "")
+
+
+async def test_reload_reports_where_the_renderer_really_is(store, clock, monkeypatch):
+    """The K17 accepted the Seek after a reload but played from 0:00."""
+    b = make_backend(store, clock)
+    positions = []
+    b.on_position_update(positions.append)
+    b._next_track_proxy_url = NEXT
+    b._furthest_position_ms = 90_000
+    b._client.get_position_info.side_effect = [1_000] + [3_000] * 20
+    await poll(b, monkeypatch)
+    b._client.seek.assert_awaited_once_with(90_000)
+    assert positions[-1] == 3_000

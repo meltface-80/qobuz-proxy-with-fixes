@@ -49,7 +49,12 @@ class ModelProfile:
 
     id: str
     label: str
-    manufacturer: re.Pattern[str]
+    # Matched anywhere in the device's identity: manufacturer, model name,
+    # friendly name and UDN. Vendors that ship a stock renderer keep its
+    # manufacturer string (the FiiO K17 reports gmediarender's authors), so
+    # the brand often only shows in the model name or UDN.
+    brand: re.Pattern[str]
+    # Matched against the model name or the friendly name.
     model: re.Pattern[str]
     # SetNextAVTransportURI queues the next track and moves on to it at the
     # end of the current one, as the spec says.
@@ -70,21 +75,25 @@ PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile(
         id="fiio-k17",
         label="FiiO K17",
-        manufacturer=_rx(r"fiio"),
+        brand=_rx(r"fiio"),
         model=_rx(r"\bk17\b"),
         gapless=False,
         stops_at_end=False,
         notes=(
-            "DLNA firmware (Aug 2026): reported to start a queued "
-            "SetNextAVTransportURI track at once, and to stay PLAYING with its "
-            "position parked at a track's end. Remove these flags if a later "
-            "firmware fixes either."
+            "Tested on a K17 with hand-sent SOAP (Nov 2026). It describes itself as "
+            "stock gmediarender (manufacturer 'Ivo Clarysse, Henner Zeller', "
+            "modelName 'FIIO K17', UDN uuid:FiiORender-...) and fetches audio with "
+            "ffmpeg. SetNextAVTransportURI replaces the playing track at once, even "
+            "when sent 20 s into a track, and the queued URI survives Stop until an "
+            "empty SetNextAVTransportURI clears it. At a track's end it stays "
+            "PLAYING with RelTime parked at TrackDuration, with Content-Length known "
+            "and no next track queued, and sends no STOPPED event either."
         ),
     ),
     ModelProfile(
         id="fiio-sr11",
         label="FiiO SR11",
-        manufacturer=_rx(r"fiio"),
+        brand=_rx(r"fiio"),
         model=_rx(r"\bsr11\b"),
         gapless=True,
         reports_next_early=True,
@@ -97,10 +106,15 @@ PROFILES: tuple[ModelProfile, ...] = (
 )
 
 
-def profile_for(manufacturer: str, model: str) -> Optional[ModelProfile]:
+def profile_for(
+    manufacturer: str, model: str, friendly_name: str = "", udn: str = ""
+) -> Optional[ModelProfile]:
     """The built-in profile matching this renderer, if any."""
+    identity = " ".join((manufacturer or "", model or "", friendly_name or "", udn or ""))
     for profile in PROFILES:
-        if profile.manufacturer.search(manufacturer or "") and profile.model.search(model or ""):
+        if profile.brand.search(identity) and (
+            profile.model.search(model or "") or profile.model.search(friendly_name or "")
+        ):
             return profile
     return None
 
@@ -193,10 +207,11 @@ def resolve_quirks(
     model: str,
     gapless_mode: str = GAPLESS_AUTO,
     store: Optional[QuirkStore] = None,
+    friendly_name: str = "",
 ) -> DeviceQuirks:
     """Combine profile, learned and user layers for one renderer."""
     quirks = DeviceQuirks()
-    profile = profile_for(manufacturer, model)
+    profile = profile_for(manufacturer, model, friendly_name, udn)
     if profile:
         quirks.profile_id = profile.id
         for name in _FIELDS:

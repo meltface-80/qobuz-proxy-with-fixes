@@ -64,19 +64,26 @@ EARLY_STOP_MARGIN_MS = 15_000
 # NextURI that arrives during TRANSITIONING. Confirmed once the reported
 # position reaches ARM_AFTER_POSITION_MS, or (for renderers that never report
 # a position) after PLAYING has been seen for ARM_AFTER_PLAYING_SECONDS.
-ARM_AFTER_POSITION_MS = 3_000
-ARM_AFTER_PLAYING_SECONDS = 4.0
+# Arming no earlier than 5 s in also keeps an early switch visible: a jump
+# back to the start of the queued track is then at least 2 s.
+ARM_AFTER_POSITION_MS = 5_000
+ARM_AFTER_PLAYING_SECONDS = 5.0
 
 # A renderer that stays PLAYING at the end of a track (position parked at the
-# track length, never STOPPED). The track counts as ended when its position is
-# within END_WINDOW_MS of the length and has not moved for:
-#   END_STALL_DELIVERED_SECONDS  the proxy has sent the whole file
-#   END_STALL_KNOWN_SECONDS      the renderer is known not to report STOPPED
-#   END_STALL_SECONDS            otherwise
+# track length, never STOPPED; the FiiO K17 does this even with the stream's
+# length known). With gapless off, this wait is most of the gap between
+# tracks, so it is kept short where the evidence allows. The track counts as
+# ended when the position has not moved for:
+#   END_STALL_AT_END_SECONDS     at or past the length, with the whole file
+#                                sent or a renderer known not to stop
+#   END_STALL_DELIVERED_SECONDS  within END_WINDOW_MS of it, whole file sent
+#   END_STALL_KNOWN_SECONDS      within the window, renderer known not to stop
+#   END_STALL_SECONDS            otherwise, or with a next track armed
 # or once the position runs PAST_END_MS beyond the length.
 END_WINDOW_MS = 2_000
+END_STALL_AT_END_SECONDS = 1.0
 END_STALL_DELIVERED_SECONDS = 2.0
-END_STALL_KNOWN_SECONDS = 4.0
+END_STALL_KNOWN_SECONDS = 3.0
 END_STALL_SECONDS = 6.0
 PAST_END_MS = 4_000
 # A position counts as "not moving" while it stays within this of where the
@@ -98,6 +105,16 @@ SEEK_SETTLE_SECONDS = 5.0
 # A stop at the end of a track with a next track armed this long before it
 # means the renderer ignores SetNextAVTransportURI.
 IGNORED_NEXT_ARMED_FOR_SECONDS = 10.0
+
+# After a seek, the position is read back this many times (0.25 s apart) to
+# confirm the renderer got there, within this tolerance.
+SEEK_CONFIRM_STEPS = 8
+SEEK_CONFIRM_TOLERANCE_MS = 2_000
+# After an early switch, the current track is sought back only when at least
+# this much would otherwise be replayed; earlier it restarts from the start,
+# sparing a renderer that just misbehaved a Seek. (A FiiO K17 crashed shortly
+# after a reload + Seek; cause not proven.)
+EARLY_SWITCH_MIN_SEEK_MS = 30_000
 
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
@@ -225,6 +242,8 @@ class DLNABackend(AudioBackend):
         self._last_seek_at: float = 0.0
         # The track URL a stalled end was already reported for.
         self._end_handled_for: Optional[str] = None
+        # Fire-and-forget renderer commands, kept referenced until they finish.
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Sonos queue-based playback (for Sonos app metadata display)
         self._is_sonos: bool = False
@@ -428,6 +447,7 @@ class DLNABackend(AudioBackend):
             device_info.model_name,
             self._gapless_mode,
             self._quirk_store,
+            friendly_name=getattr(device_info, "friendly_name", ""),
         )
         # Sonos gapless goes through its own queue, not SetNextAVTransportURI.
         if not self._is_sonos:
@@ -953,9 +973,30 @@ class DLNABackend(AudioBackend):
             and await self._owns_transport()
         ):
             await self._client.remove_track_from_queue(self._next_track_queue_nr)
+        elif not self._is_sonos and self._next_track_proxy_url and await self._owns_transport():
+            await self._disarm_on_renderer()
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+
+    async def _disarm_on_renderer(self) -> None:
+        """Clear the renderer's NextURI with an empty SetNextAVTransportURI.
+
+        Forgetting the armed track locally is not enough: the FiiO K17 keeps a
+        queued URI through Stop and later tracks until it is cleared. Errors
+        are ignored.
+        """
+        if not self._client:
+            return
+        result = await self._client.set_next_av_transport_uri("", "")
+        if not result.success:
+            logger.debug(f"[{self.name}] Clearing NextURI failed: {result.error_code}")
+
+    def _disarm_soon(self) -> None:
+        """Clear the renderer's NextURI from a synchronous code path."""
+        task = asyncio.ensure_future(self._disarm_on_renderer())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # =========================================================================
     # Internal
@@ -1093,6 +1134,7 @@ class DLNABackend(AudioBackend):
                                 False,
                                 "stopped at the end of a track with the next one queued",
                             )
+                            self._disarm_soon()
 
                         if early_stop:
                             logger.info(
@@ -1189,11 +1231,10 @@ class DLNABackend(AudioBackend):
         """
         if self._is_sonos or not self._next_track_proxy_url:
             return False
-        now = time.monotonic()
-        if (
-            now - self._last_seek_at < SEEK_SETTLE_SECONDS
-            or now - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS
-        ):
+        # No start-of-track grace here: arming waits for the renderer to play
+        # (ARM_AFTER_POSITION_MS), and a renderer that switches at once does so
+        # inside the first seconds, where a grace period could hide the jump.
+        if time.monotonic() - self._last_seek_at < SEEK_SETTLE_SECONDS:
             return False
         remaining = self._duration_ms - furthest_before if self._duration_ms > 0 else None
         return (
@@ -1213,6 +1254,8 @@ class DLNABackend(AudioBackend):
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._next_track_queue_nr = None
+        # The renderer keeps the queued URI (FiiO K17) until it is cleared.
+        await self._disarm_on_renderer()
         if self._quirks.sources.get("gapless") == "user":
             logger.warning(
                 "[%s] Gapless is forced on for this speaker; set it to auto or off "
@@ -1228,6 +1271,7 @@ class DLNABackend(AudioBackend):
         didl = self._build_didl(url, metadata, content_type)
         self._delivered_keys.discard(_proxy_key(url))
         self._starting_playback = True
+        reached = 0
         try:
             if await self._try_transport_sequence(url, didl) is not None:
                 logger.warning("[%s] Could not reload the current track", self.name)
@@ -1238,19 +1282,49 @@ class DLNABackend(AudioBackend):
                 await asyncio.sleep(0.25)
                 if await self._client.get_transport_info() == "PLAYING":
                     break
-            if resume_ms > 0 and await self._client.seek(resume_ms):
-                self._last_seek_at = time.monotonic()
+            # With little to lose, restart rather than send one more command
+            # to a renderer that just misbehaved.
+            if resume_ms >= EARLY_SWITCH_MIN_SEEK_MS:
+                reached = await self._seek_and_confirm(resume_ms)
         finally:
             self._starting_playback = False
-        self._position_ms = resume_ms
-        self._furthest_position_ms = resume_ms
+        self._position_ms = reached
+        self._furthest_position_ms = reached
         self._stall_position_ms = -1
-        self._notify_position_update(resume_ms)
+        self._notify_position_update(reached)
         logger.info(
-            "[%s] Current track reloaded at %s; gapless is off for this renderer",
+            "[%s] Current track reloaded, now at %s; gapless is off for this renderer",
             self.name,
-            _format_ms(resume_ms),
+            _format_ms(reached),
         )
+
+    async def _seek_and_confirm(self, target_ms: int) -> int:
+        """Seek, then read back where the renderer really is.
+
+        A renderer can accept a Seek and ignore it (a FiiO K17 right after a
+        reload restarted from 0:00), so the position reported to the app is
+        read from the renderer rather than assumed.
+        """
+        assert self._client
+        if not await self._client.seek(target_ms):
+            logger.info("[%s] Renderer refused the seek; track restarted", self.name)
+            return 0
+        self._last_seek_at = time.monotonic()
+        position: Optional[int] = None
+        for _ in range(SEEK_CONFIRM_STEPS):
+            await asyncio.sleep(0.25)
+            position = await self._client.get_position_info()
+            if position is not None and position >= target_ms - SEEK_CONFIRM_TOLERANCE_MS:
+                return position
+        if position is None:
+            return target_ms  # renderer reports no position: assume the seek held
+        logger.warning(
+            "[%s] Seek to %s did not take effect; renderer is at %s",
+            self.name,
+            _format_ms(target_ms),
+            _format_ms(position),
+        )
+        return position
 
     def _ended_without_stop(self, pos: int) -> bool:
         """Whether a renderer still reporting PLAYING has finished the track.
@@ -1264,6 +1338,7 @@ class DLNABackend(AudioBackend):
             or self._starting_playback
             or self._end_handled_for == self._current_proxy_url
             or time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS
+            or time.monotonic() - self._last_seek_at < SEEK_SETTLE_SECONDS
         ):
             return False
         now = time.monotonic()
@@ -1274,13 +1349,17 @@ class DLNABackend(AudioBackend):
             return True
         if pos < duration - END_WINDOW_MS:
             return False
+        delivered = _proxy_key(self._current_proxy_url or "") in self._delivered_keys
+        known = self._quirks.stops_at_end is False
         if self._next_track_proxy_url:
             # A renderer about to move on to the armed track may hold at the
             # end for a moment; give it the full time before stepping in.
             needed = END_STALL_SECONDS
-        elif _proxy_key(self._current_proxy_url or "") in self._delivered_keys:
+        elif pos >= duration and (delivered or known):
+            needed = END_STALL_AT_END_SECONDS
+        elif delivered:
             needed = END_STALL_DELIVERED_SECONDS
-        elif self._quirks.stops_at_end is False:
+        elif known:
             needed = END_STALL_KNOWN_SECONDS
         else:
             needed = END_STALL_SECONDS
@@ -1306,6 +1385,8 @@ class DLNABackend(AudioBackend):
                 False,
                 "stayed on a finished track with the next one queued",
             )
+        if self._next_track_proxy_url and not self._is_sonos:
+            self._disarm_soon()
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._end_handled_for = self._current_proxy_url
