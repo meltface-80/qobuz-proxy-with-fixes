@@ -73,3 +73,13 @@ IGNORED_NEXT_ARMED_FOR_SECONDS = 10.0
 # the track; wait this long (in steps) for it to play before seeking.
 RELOAD_PLAYING_WAIT_STEPS = 20
 RELOAD_PLAYING_STEP_SECONDS = 0.25
+# After a seek, the position is read back this many times (one step apart) to
+# confirm the renderer got there, within this tolerance.
+SEEK_CONFIRM_STEPS = 8
+SEEK_CONFIRM_TOLERANCE_MS = 2_000
+
+# After an early switch, the current track is reloaded at its position only
+# when at least this much would otherwise be replayed; earlier it restarts
+# from the beginning, sparing a renderer that just misbehaved a Seek. (A FiiO
+# K17 crashed shortly after a reload + Seek; cause not proven.)
+EARLY_SWITCH_MIN_SEEK_MS = 30_000

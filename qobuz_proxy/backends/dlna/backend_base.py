@@ -30,9 +30,14 @@ from .capabilities import (
 )
 from .client import DLNAClient
 from .description import DLNADeviceInfo
-from .didl import build_didl, proxy_key
+from .didl import build_didl, format_ms, proxy_key
 from .events import EventSubscription
-from .timing import RELOAD_PLAYING_STEP_SECONDS, RELOAD_PLAYING_WAIT_STEPS
+from .timing import (
+    RELOAD_PLAYING_STEP_SECONDS,
+    RELOAD_PLAYING_WAIT_STEPS,
+    SEEK_CONFIRM_STEPS,
+    SEEK_CONFIRM_TOLERANCE_MS,
+)
 from .quirks import (
     GAPLESS_AUTO,
     DeviceQuirks,
@@ -390,12 +395,15 @@ class DLNABackendBase(AudioBackend):
             if await self._client.get_transport_info() == "PLAYING":
                 return
 
-    async def _reload_current_track(self, resume_ms: int) -> bool:
+    async def _reload_current_track(self, resume_ms: int, min_seek_ms: int = 0) -> bool:
         """Load the current track again and seek to ``resume_ms``.
 
         Used where the renderer lost our track: after a Pause carried out as
         a Stop, and after a renderer jumped to the queued track too early.
-        Returns False if the renderer would not load it.
+        Below ``min_seek_ms`` the track restarts from the beginning instead
+        of seeking: one command fewer to a renderer that just misbehaved.
+        The position reported afterwards is the one the renderer reached,
+        not the one asked for. Returns False if the renderer would not load it.
         """
         url, metadata = self._current_proxy_url, self._current_metadata
         if not url or not metadata or not self._client:
@@ -405,6 +413,7 @@ class DLNABackendBase(AudioBackend):
         didl = self._build_didl(url, metadata, content_type, size)
         self._forget_delivery(url)
         self._starting_playback = True
+        reached = 0
         try:
             if await self._try_transport_sequence(url, didl) is not None:
                 logger.warning("[%s] Could not reload the current track", self.name)
@@ -413,15 +422,40 @@ class DLNABackendBase(AudioBackend):
             self._last_stop_at = None
             # Seek once the renderer is playing again (most refuse it before).
             await self._wait_until_playing()
-            if resume_ms > 0 and await self._client.seek(resume_ms):
-                self._last_seek_at = time.monotonic()
-            elif resume_ms > 0:
-                logger.info("[%s] Renderer refused the seek; track restarted", self.name)
-                resume_ms = 0
+            if resume_ms > 0 and resume_ms >= min_seek_ms:
+                reached = await self._seek_and_confirm(resume_ms)
         finally:
             self._starting_playback = False
-        self._position_ms = resume_ms
-        self._furthest_position_ms = resume_ms
+        self._position_ms = reached
+        self._furthest_position_ms = reached
         self._stall_position_ms = -1
-        self._notify_position_update(resume_ms)
+        self._notify_position_update(reached)
         return True
+
+    async def _seek_and_confirm(self, target_ms: int) -> int:
+        """Seek, then read back where the renderer really is.
+
+        A renderer can accept a Seek and ignore it (a FiiO K17 right after a
+        reload restarted from 0:00), so the position reported to the app is
+        read from the renderer rather than assumed.
+        """
+        assert self._client
+        if not await self._client.seek(target_ms):
+            logger.info("[%s] Renderer refused the seek; track restarted", self.name)
+            return 0
+        self._last_seek_at = time.monotonic()
+        position: Optional[int] = None
+        for _ in range(SEEK_CONFIRM_STEPS):
+            await asyncio.sleep(RELOAD_PLAYING_STEP_SECONDS)
+            position = await self._client.get_position_info()
+            if position is not None and position >= target_ms - SEEK_CONFIRM_TOLERANCE_MS:
+                return position
+        if position is None:
+            return target_ms  # renderer reports no position: assume the seek held
+        logger.warning(
+            "[%s] Seek to %s did not take effect; renderer is at %s",
+            self.name,
+            format_ms(target_ms),
+            format_ms(position),
+        )
+        return position

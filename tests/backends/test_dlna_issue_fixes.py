@@ -374,3 +374,37 @@ async def test_nothing_to_clear_sends_nothing(store, clock):
     b = make_backend(store, clock)
     await b.clear_next_track()
     b._client.set_next_av_transport_uri.assert_not_called()
+
+
+async def test_reload_reports_where_the_renderer_really_is(store, clock, monkeypatch):
+    """A K17 accepted the Seek after a reload but restarted from 0:00; the
+    position reported must be the renderer's, not the one asked for."""
+    monkeypatch.setattr("qobuz_proxy.backends.dlna.backend_base.asyncio.sleep", AsyncMock())
+    b = make_backend(store, clock)
+    positions = []
+    b.on_position_update(positions.append)
+    b._client.get_position_info.return_value = 3_000  # seek ignored
+    assert await b._reload_current_track(90_000)
+    b._client.seek.assert_awaited_once_with(90_000)
+    assert positions[-1] == 3_000 and b._position_ms == 3_000
+
+
+async def test_reload_seek_that_holds(store, clock, monkeypatch):
+    monkeypatch.setattr("qobuz_proxy.backends.dlna.backend_base.asyncio.sleep", AsyncMock())
+    b = make_backend(store, clock)
+    b._client.get_position_info.return_value = 90_500
+    assert await b._reload_current_track(90_000)
+    assert b._position_ms == 90_500
+
+
+async def test_real_k17_never_receives_set_next(store, clock):
+    """Learning would need one SetNextAVTransportURI, which upsets a K17;
+    the profile must already rule gapless out for the real description."""
+    from qobuz_proxy.backends.types import BackendTrackMetadata
+
+    b = make_backend(store, clock, manufacturer="Ivo Clarysse, Henner Zeller", model="FIIO K17")
+    assert b.supports_gapless is False
+    b._playing_confirmed = True
+    meta = BackendTrackMetadata(track_id="456", title="N", artist="A", album="B", duration_ms=1)
+    assert await b.set_next_track(NEXT, meta, 2) is False
+    b._client.set_next_av_transport_uri.assert_not_called()

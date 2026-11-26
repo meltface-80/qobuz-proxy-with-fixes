@@ -27,6 +27,7 @@ from .timing import (
     ARM_AFTER_PLAYING_SECONDS,
     ARM_AFTER_POSITION_MS,
     EARLY_SWITCH_BACK_MS,
+    EARLY_SWITCH_MIN_SEEK_MS,
     EARLY_SWITCH_REMAINING_MS,
     EARLY_SWITCH_TO_MS,
     SEEK_SETTLE_SECONDS,
@@ -299,9 +300,9 @@ class GaplessMixin(OwnershipMixin):
                 self.name,
             )
             return
-        if await self._reload_current_track(resume_ms):
+        if await self._reload_current_track(resume_ms, min_seek_ms=EARLY_SWITCH_MIN_SEEK_MS):
             logger.info(
-                "[%s] Current track reloaded at %s; gapless is off for this renderer",
+                "[%s] Current track reloaded, now at %s; gapless is off for this renderer",
                 self.name,
                 format_ms(self._position_ms),
             )

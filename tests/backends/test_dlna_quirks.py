@@ -215,7 +215,10 @@ async def test_early_switch_right_after_arming(store, clock, monkeypatch):
     b._client.get_position_info.return_value = 0
     await poll(b, monkeypatch, times=3)
     assert store.get(UDN)["gapless"] is False
-    b._client.seek.assert_called_once_with(4_000)
+    # Little to lose this early: the track restarts rather than seek on a
+    # renderer that just misbehaved (a K17 crashed after reload + Seek).
+    b._client.set_av_transport_uri.assert_called_once()
+    b._client.seek.assert_not_called()
 
 
 async def test_armed_next_waits_full_stall_time(store, clock):
