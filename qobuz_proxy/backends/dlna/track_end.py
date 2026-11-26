@@ -16,6 +16,7 @@ from .didl import format_ms, proxy_key
 from .gapless import GaplessMixin
 from .timing import (
     EARLY_STOP_MARGIN_MS,
+    END_STALL_AT_END_SECONDS,
     END_STALL_DELIVERED_SECONDS,
     END_STALL_KNOWN_SECONDS,
     END_STALL_SECONDS,
@@ -87,6 +88,7 @@ class TrackEndMixin(GaplessMixin):
         # SetNextAVTransportURI.
         if not early_stop and armed_for >= IGNORED_NEXT_ARMED_FOR_SECONDS:
             self._learn("gapless", False, "stopped at the end of a track with the next one queued")
+            self._disarm_soon()
 
         if early_stop:
             logger.info(
@@ -144,17 +146,23 @@ class TrackEndMixin(GaplessMixin):
             return True
         if pos < duration - END_WINDOW_MS:
             return False
+        return now - self._stall_since >= self._end_stall_needed(pos >= duration)
+
+    def _end_stall_needed(self, at_end: bool) -> float:
+        """Seconds a parked position must hold before it counts as the end."""
         if self._next_track_proxy_url:
             # A renderer about to move on to the armed track may hold at the
             # end for a moment; give it the full time before stepping in.
-            needed = END_STALL_SECONDS
-        elif proxy_key(self._current_proxy_url or "") in self._delivered_keys:
-            needed = END_STALL_DELIVERED_SECONDS
-        elif self._quirks.stops_at_end is False:
-            needed = END_STALL_KNOWN_SECONDS
-        else:
-            needed = END_STALL_SECONDS
-        return now - self._stall_since >= needed
+            return END_STALL_SECONDS
+        delivered = proxy_key(self._current_proxy_url or "") in self._delivered_keys
+        known = self._quirks.stops_at_end is False
+        if at_end and (delivered or known):
+            return END_STALL_AT_END_SECONDS
+        if delivered:
+            return END_STALL_DELIVERED_SECONDS
+        if known:
+            return END_STALL_KNOWN_SECONDS
+        return END_STALL_SECONDS
 
     def _handle_end_without_stop(self, pos: int) -> None:
         """Report a track end the renderer itself never signalled."""
@@ -172,6 +180,8 @@ class TrackEndMixin(GaplessMixin):
             and time.monotonic() - self._next_armed_at >= IGNORED_NEXT_ARMED_FOR_SECONDS
         ):
             self._learn("gapless", False, "stayed on a finished track with the next one queued")
+        if self._next_track_proxy_url and not self._is_sonos:
+            self._disarm_soon()
         self._next_track_proxy_url = None
         self._next_track_metadata = None
         self._report_track_end()

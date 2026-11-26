@@ -27,6 +27,7 @@ from .timing import (  # noqa: F401 (re-exported for callers and tests)
     ARM_AFTER_PLAYING_SECONDS,
     ARM_AFTER_POSITION_MS,
     EARLY_STOP_MARGIN_MS,
+    END_STALL_AT_END_SECONDS,
     END_STALL_DELIVERED_SECONDS,
     END_STALL_KNOWN_SECONDS,
     END_STALL_SECONDS,

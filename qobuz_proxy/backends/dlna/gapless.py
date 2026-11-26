@@ -14,6 +14,7 @@ Arming waits until the renderer has been heard playing the current track,
 and what the renderer is seen to do is learned per UDN (see ``quirks.py``).
 """
 
+import asyncio
 import logging
 import time
 
@@ -28,7 +29,6 @@ from .timing import (
     EARLY_SWITCH_BACK_MS,
     EARLY_SWITCH_REMAINING_MS,
     EARLY_SWITCH_TO_MS,
-    PLAYBACK_START_GRACE_PERIOD_SECONDS,
     SEEK_SETTLE_SECONDS,
 )
 
@@ -149,7 +149,29 @@ class GaplessMixin(OwnershipMixin):
             and await self._owns_transport()
         ):
             await self._client.remove_track_from_queue(self._next_track_queue_nr)
+        elif not self._is_sonos and self._next_track_proxy_url and await self._owns_transport():
+            await self._disarm_on_renderer()
         self._clear_next_track()
+
+    async def _disarm_on_renderer(self) -> None:
+        """Clear the renderer's NextURI with an empty SetNextAVTransportURI.
+
+        Forgetting the armed track locally is not enough: the FiiO K17 keeps a
+        queued URI through Stop and later tracks until it is cleared. Errors
+        are ignored (renderers that refuse an empty NextURI have nothing to
+        clear that matters).
+        """
+        if not self._client:
+            return
+        result = await self._client.set_next_av_transport_uri("", "")
+        if not result.success:
+            logger.debug(f"[{self.name}] Clearing NextURI failed: {result.error_code}")
+
+    def _disarm_soon(self) -> None:
+        """Clear the renderer's NextURI from a synchronous code path."""
+        task = asyncio.ensure_future(self._disarm_on_renderer())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # =========================================================================
     # Transition detection
@@ -243,11 +265,10 @@ class GaplessMixin(OwnershipMixin):
         """
         if self._is_sonos or not self._next_track_proxy_url:
             return False
-        now = time.monotonic()
-        if (
-            now - self._last_seek_at < SEEK_SETTLE_SECONDS
-            or now - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS
-        ):
+        # No start-of-track grace here: arming waits for the renderer to play
+        # (ARM_AFTER_POSITION_MS), and a renderer that switches at once does so
+        # inside the first seconds, where a grace period would hide the jump.
+        if time.monotonic() - self._last_seek_at < SEEK_SETTLE_SECONDS:
             return False
         if (
             self._proxy_server is not None
@@ -270,6 +291,7 @@ class GaplessMixin(OwnershipMixin):
         )
         self._learn("gapless", False, "starts a queued track as soon as it is queued")
         self._clear_next_track()
+        await self._disarm_on_renderer()
         if self._quirks.sources.get("gapless") == "user":
             logger.warning(
                 "[%s] Gapless is forced on for this speaker; set it to auto or off "

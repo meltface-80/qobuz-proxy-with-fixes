@@ -84,6 +84,8 @@ class DLNABackendBase(AudioBackend):
         self._events_task: Optional[asyncio.Task[None]] = None
         self._events_active = False
         self._event_token = secrets.token_hex(8)
+        # Fire-and-forget renderer commands, kept referenced until they finish.
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
         self._current_metadata: Optional[BackendTrackMetadata] = None
         self._position_ms: int = 0
@@ -196,6 +198,7 @@ class DLNABackendBase(AudioBackend):
             device_info.model_name,
             self._gapless_mode,
             self._quirk_store,
+            friendly_name=getattr(device_info, "friendly_name", ""),
         )
         # The service description says SetNextAVTransportURI does not exist:
         # no need to try it (unless the user forced gapless on).

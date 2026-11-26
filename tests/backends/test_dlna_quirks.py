@@ -9,6 +9,8 @@ import pytest
 
 from qobuz_proxy.backends.dlna.backend import (
     ARM_AFTER_PLAYING_SECONDS,
+    ARM_AFTER_POSITION_MS,
+    END_STALL_AT_END_SECONDS,
     END_STALL_DELIVERED_SECONDS,
     END_STALL_KNOWN_SECONDS,
     END_STALL_SECONDS,
@@ -78,7 +80,9 @@ async def test_no_arming_until_renderer_heard_playing(store, clock):
     assert await b.set_next_track(NEXT, meta, 2) is False
     b._client.set_next_av_transport_uri.assert_not_called()
 
-    b._note_playing(3_000)
+    b._note_playing(ARM_AFTER_POSITION_MS - 1_000)
+    assert b.ready_for_next_track is False
+    b._note_playing(ARM_AFTER_POSITION_MS)
     assert b.ready_for_next_track is True
     assert await b.set_next_track(NEXT, meta, 2) is True
     b._client.set_next_av_transport_uri.assert_called_once()
@@ -103,30 +107,35 @@ async def test_poll_confirms_playing(store, clock, monkeypatch):
 # --------------------------------------------------------------- end without STOPPED
 
 
-def parked(b, clock, seconds):
-    """Report a stalled position at the track's end for ``seconds``."""
-    assert not b._ended_without_stop(200_000)
+def parked(b, clock, seconds, pos=200_000):
+    """Report a stalled position (default: at the track's end) for ``seconds``."""
+    assert not b._ended_without_stop(pos)
     clock.now += seconds
-    return b._ended_without_stop(200_000)
+    return b._ended_without_stop(pos)
 
 
 @pytest.mark.parametrize(
-    "delivered, known, needed",
+    "pos, delivered, known, needed",
     [
-        (True, False, END_STALL_DELIVERED_SECONDS),
-        (False, True, END_STALL_KNOWN_SECONDS),
-        (False, False, END_STALL_SECONDS),
+        # Parked at the length (where the K17 parks): short wait with evidence.
+        (200_000, True, False, END_STALL_AT_END_SECONDS),
+        (200_000, False, True, END_STALL_AT_END_SECONDS),
+        (200_000, False, False, END_STALL_SECONDS),
+        # Parked just short of it (Qobuz's length can differ by a second).
+        (199_000, True, False, END_STALL_DELIVERED_SECONDS),
+        (199_000, False, True, END_STALL_KNOWN_SECONDS),
+        (199_000, False, False, END_STALL_SECONDS),
     ],
 )
-def test_end_stall_thresholds(store, clock, delivered, known, needed):
+def test_end_stall_thresholds(store, clock, pos, delivered, known, needed):
     b = make_backend(store, clock)
     if delivered:
         b._on_delivery_complete("123")
     if known:
         b._quirks.stops_at_end = False
-    assert not parked(b, clock, needed - 0.5)
+    assert not parked(b, clock, needed - 0.5, pos)
     clock.now += 0.5
-    assert b._ended_without_stop(200_000)
+    assert b._ended_without_stop(pos)
 
 
 def test_moving_position_near_end_is_not_a_stall(store, clock):

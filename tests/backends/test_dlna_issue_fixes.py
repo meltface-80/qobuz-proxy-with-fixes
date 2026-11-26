@@ -310,3 +310,67 @@ def test_parse_last_change():
     )
     assert parse_last_change(body) == {"TransportState": "PLAYING"}
     assert parse_last_change("not xml<") == {}
+
+
+# ------------------------------------------------------------- FiiO K17 (real device)
+# From hand-sent SOAP against a real K17: it describes itself as stock
+# gmediarender, replaces the playing track as soon as a next one is queued, and
+# keeps a queued URI through Stop until an empty SetNextAVTransportURI clears it.
+
+K17_IDENTITY = {
+    "manufacturer": "Ivo Clarysse, Henner Zeller",
+    "model": "FIIO K17",
+    "friendly_name": "FIIO K17",
+    "udn": "uuid:FiiORender-1234",
+}
+
+
+def test_k17_profile_matches_the_real_description():
+    from qobuz_proxy.backends.dlna.quirks import profile_for, resolve_quirks
+
+    k = K17_IDENTITY
+    profile = profile_for(k["manufacturer"], k["model"], k["friendly_name"], k["udn"])
+    assert profile is not None and profile.id == "fiio-k17"
+    q = resolve_quirks(k["udn"], k["manufacturer"], k["model"], friendly_name=k["friendly_name"])
+    assert q.gapless is False and q.stops_at_end is False and q.max_quality == 27
+    # A plain gmediarender, or another brand's "K17", is not a FiiO K17.
+    assert profile_for(k["manufacturer"], "gmediarender", "Living Room", "uuid:abc") is None
+    assert profile_for("Acme", "K17", "K17", "uuid:abc") is None
+
+
+async def test_early_switch_caught_right_after_arming_early_in_a_track(store, clock, monkeypatch):
+    """Armed 5 s into a track that only just started: the start grace period
+    must not hide the jump back to 0:00 (it did, with arming at 3 s)."""
+    b = make_backend(store, clock)
+    b._playback_started_at = clock.now - 4.0  # inside the 5 s start grace period
+    b._proxy_server = MagicMock()
+    b._next_track_proxy_url = NEXT
+    b._requested_keys.add("456_2")  # the K17 fetched the queued track at once
+    b._furthest_position_ms = 5_000
+    b._client.get_position_info.return_value = 1_000
+    await poll(b, monkeypatch)
+    assert b.supports_gapless is False
+    b._client.set_av_transport_uri.assert_called()  # current track reloaded
+
+
+async def test_early_switch_clears_the_queued_uri_on_the_renderer(store, clock, monkeypatch):
+    b = make_backend(store, clock)
+    b._next_track_proxy_url = NEXT
+    b._furthest_position_ms = 60_000
+    b._client.get_position_info.return_value = 1_000
+    await poll(b, monkeypatch)
+    b._client.set_next_av_transport_uri.assert_awaited_with("", "")
+
+
+async def test_clearing_the_next_track_clears_it_on_the_renderer(store, clock):
+    b = make_backend(store, clock)
+    b._next_track_proxy_url = NEXT
+    await b.clear_next_track()
+    b._client.set_next_av_transport_uri.assert_awaited_once_with("", "")
+    assert b._next_track_proxy_url is None
+
+
+async def test_nothing_to_clear_sends_nothing(store, clock):
+    b = make_backend(store, clock)
+    await b.clear_next_track()
+    b._client.set_next_av_transport_uri.assert_not_called()

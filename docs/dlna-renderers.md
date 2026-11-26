@@ -54,9 +54,17 @@ Renderer behaviour comes in layers, each overriding the one before:
 |---|---|
 | Spec defaults | What the UPnP AVTransport spec promises |
 | Service description | `SetNextAVTransportURI` missing from the AVTransport SCPD turns gapless off |
-| Model profile | Built-in table matched on manufacturer and model (FiiO K17, FiiO SR11, Bose SoundTouch) |
+| Model profile | Built-in table: a brand anywhere in the device identity (manufacturer, model name, friendly name, UDN) plus the model in its model or friendly name (FiiO K17, FiiO SR11, Bose SoundTouch). Vendors shipping stock renderers keep the stock manufacturer: a FiiO K17 reports gmediarender's authors. |
 | Learned | What this renderer was seen to do, saved per UDN in `dlna_quirks.json` in the data directory |
 | User | The speaker's gapless setting (`auto`, `on`, `off`) |
+
+A next track is queued only once the renderer is heard playing the current
+one (position 5 s, or PLAYING for 5 s). That does not help renderers that
+replace the playing track whenever one is queued (the FiiO K17 does so even
+20 s in); for those, gapless must be off, which their profile or the first
+early switch takes care of. A cleared next track is also cleared on the
+renderer with an empty `SetNextAVTransportURI`, since the K17 otherwise keeps
+it through Stop and later tracks.
 
 What is learned at runtime:
 
@@ -64,7 +72,7 @@ What is learned at runtime:
 |---|---|---|
 | `SetNextAVTransportURI` refused (401/602) | `gapless=False` | Each track is started on its own |
 | Stopped at a track end with the next track queued for 10 s or more | `gapless=False` | As above |
-| Jumped to the queued track early (position back to the start, and the renderer fetched the queued track from the proxy) | `gapless=False` | The current track is reloaded at its position |
+| Jumped to the queued track early (position back to the start, and the renderer fetched the queued track from the proxy) | `gapless=False` | The queued URI is cleared on the renderer and the current track is reloaded at its position |
 | Stayed PLAYING with the position parked at the end | `stops_at_end=False` | Track ends are detected from the stalled position |
 | Named the queued track as current while still playing the current one | `reports_next_early=True` | A track change counts only when the position returns to the start |
 | Refused Pause (401/602) | `can_pause=False` | Pause stops the renderer; resume reloads the track at its position |
@@ -75,12 +83,20 @@ came from. **Re-detect** forgets what was learned for that renderer.
 ## End of a track
 
 A track ends when the renderer reports STOPPED near the end, or, for
-renderers that never do, when the position stays within 2 s of the track's
-length without moving for:
+renderers that never do (the FiiO K17 stays PLAYING with its position parked
+at the track's length, even when the stream's length is known), when the
+position stops moving:
 
-- 2 s, when the proxy has sent the whole file;
-- 4 s, for a renderer known not to report STOPPED;
-- 6 s otherwise (or once the position runs 4 s past the length).
+| Position | Evidence | Wait |
+|---|---|---|
+| At or past the length | the proxy sent the whole file, or the renderer is known not to stop | 1 s |
+| Within 2 s of the length | the proxy sent the whole file | 2 s |
+| Within 2 s of the length | the renderer is known not to stop | 3 s |
+| Within 2 s of the length | none, or a next track is queued | 6 s |
+| 4 s past the length | — | at once |
+
+With gapless off, this wait is most of the gap between tracks, which is why it
+is short where the evidence allows it.
 
 The check never runs while paused, in the first seconds of a track, or just
 after a seek. Only one end is reported per playback, however the renderer
